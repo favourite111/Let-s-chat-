@@ -1,27 +1,36 @@
-# Workspace
+# VideoCall
 
-## Overview
+A browser-based 1-on-1 video call app. No accounts needed — create a room, share the link, connect face-to-face instantly.
 
-pnpm workspace monorepo using TypeScript. Each package manages its own dependencies.
+## Architecture
+
+### Frontend (`artifacts/video-call`)
+- React + Vite app served at `/`
+- Pages: Home (`/`) and Room (`/room/:roomId`)
+- Uses WebRTC for peer-to-peer video/audio
+- Uses Socket.IO client for WebRTC signaling via `/socket.io`
+- API hooks generated from OpenAPI spec
+
+### Backend (`artifacts/api-server`)
+- Express server on port 8080
+- REST API at `/api`:
+  - `POST /api/rooms` — create a new room
+  - `GET /api/rooms/:roomId` — check if a room exists
+- Socket.IO server at `/socket.io` for WebRTC signaling:
+  - Relays `offer`, `answer`, `ice-candidate` events between peers
+  - Handles room join/leave/disconnect lifecycle
+  - Max 2 participants per room
 
 ## Stack
 
-- **Monorepo tool**: pnpm workspaces
-- **Node.js version**: 24
-- **Package manager**: pnpm
-- **TypeScript version**: 5.9
-- **API framework**: Express 5
-- **Database**: PostgreSQL + Drizzle ORM
-- **Validation**: Zod (`zod/v4`), `drizzle-zod`
-- **API codegen**: Orval (from OpenAPI spec)
-- **Build**: esbuild (CJS bundle)
+- **Frontend**: React, Vite, Tailwind CSS, Wouter (routing), TanStack Query, Socket.IO client
+- **Backend**: Express, Socket.IO, TypeScript/ESBuild
+- **API Contract**: OpenAPI 3.1 → Orval codegen (hooks + Zod schemas)
 
-## Key Commands
+## Key Files
 
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- `pnpm --filter @workspace/api-server run dev` — run API server locally
-
-See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details.
+- `artifacts/video-call/src/pages/home.tsx` — landing page (create/join room)
+- `artifacts/video-call/src/pages/room.tsx` — call room with WebRTC + Socket.IO logic
+- `artifacts/api-server/src/lib/signaling.ts` — Socket.IO signaling relay
+- `artifacts/api-server/src/routes/rooms.ts` — room REST API
+- `lib/api-spec/openapi.yaml` — API contract

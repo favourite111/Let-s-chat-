@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "VideoCall"
+version = "1.0.0"
+id = "artifacts/video-call"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22041
+
+[services.development]
+run = "pnpm --filter @workspace/video-call run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/video-call", "run", "build" ]
+publicDir = "artifacts/video-call/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22041"
+BASE_PATH = "/"
