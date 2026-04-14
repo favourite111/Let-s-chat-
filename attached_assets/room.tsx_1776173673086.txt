@@ -128,6 +128,7 @@ export default function Room() {
           if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = null;
           }
+          // Reset peer connection state for next connection
           if (pcRef.current) {
              const senders = pcRef.current.getSenders();
              senders.forEach(sender => pcRef.current?.removeTrack(sender));
