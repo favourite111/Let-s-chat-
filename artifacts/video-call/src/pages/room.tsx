@@ -25,6 +25,7 @@ export default function Room() {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteUserIdRef = useRef<string | null>(null);
 
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
@@ -73,25 +74,27 @@ export default function Room() {
         };
 
         pc.onicecandidate = (event) => {
-          if (event.candidate) {
+          if (event.candidate && remoteUserIdRef.current) {
             socket.emit("ice-candidate", {
               candidate: event.candidate.toJSON(),
-              to: null, 
+              to: remoteUserIdRef.current,
             });
           }
         };
 
-        socket.on("user-connected", async () => {
+        socket.on("user-connected", async (userId: string) => {
+          remoteUserIdRef.current = userId;
           try {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            socket.emit("offer", { offer, to: null }); 
+            socket.emit("offer", { offer, to: userId });
           } catch (e) {
             console.error("Error creating offer", e);
           }
         });
 
         socket.on("offer", async ({ offer, from }: { offer: RTCSessionDescriptionInit, from: string }) => {
+          remoteUserIdRef.current = from;
           try {
             await pc.setRemoteDescription(new RTCSessionDescription(offer));
             const answer = await pc.createAnswer();
