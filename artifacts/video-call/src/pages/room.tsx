@@ -128,10 +128,11 @@ export default function Room() {
           if (remoteVideoRef.current) {
             remoteVideoRef.current.srcObject = null;
           }
+          // Reset peer connection state for next connection
           if (pcRef.current) {
              const senders = pcRef.current.getSenders();
              senders.forEach(sender => pcRef.current?.removeTrack(sender));
-             
+
              if (localStreamRef.current) {
                localStreamRef.current.getTracks().forEach(track => pcRef.current?.addTrack(track, localStreamRef.current!));
              }
@@ -274,7 +275,7 @@ export default function Room() {
             muted
             className={`w-full h-full object-cover transition-opacity duration-300 ${isVideoOff ? "opacity-0" : "opacity-100"} scale-x-[-1]`}
           />
-          
+
           <div className="absolute bottom-3 left-3 px-2 py-1 rounded-md bg-black/60 backdrop-blur text-white text-xs font-medium border border-white/10">
             You
           </div>
