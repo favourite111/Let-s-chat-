@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: videocall
+    runtime: node
+    buildCommand: pnpm install --frozen-lockfile && BASE_PATH=/ pnpm --filter @workspace/video-call run build && pnpm --filter @workspace/api-server run build
+    startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8080
