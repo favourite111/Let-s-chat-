@@ -81,10 +81,10 @@ export default function Home() {
           {/* Title */}
           <div className="space-y-3">
             <h1 className="text-5xl font-bold tracking-tight bg-gradient-to-r from-white via-white to-slate-400 bg-clip-text text-transparent">
-              VideoCall
+          Impeccable-Call
             </h1>
             <p className="text-slate-400 text-lg font-light">
-              Connect instantly, face-to-face.
+            built by impeccable Connect instantly, face-to-face.
             </p>
           </div>
 
@@ -95,7 +95,7 @@ export default function Home() {
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
               </span>
-              Systems Operational
+              Systems still under Development 
             </div>
           )}
         </div>
