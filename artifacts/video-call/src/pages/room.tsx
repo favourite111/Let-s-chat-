@@ -1,5 +1,5 @@
- import React, { useEffect, useRef, useState, useCallback } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import { useParams, useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
@@ -16,7 +16,7 @@ import {
 
 export default function Room() {
   const { roomId } = useParams<{ roomId: string }>();
-  const navigate = useNavigate();
+  const [, navigate] = useLocation();
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
