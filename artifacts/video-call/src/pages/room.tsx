@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useLocation } from "wouter";
+import { useGetRoom } from "@workspace/api-client-react";
+import { io, Socket } from "socket.io-client";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
@@ -10,210 +12,632 @@ import {
   PhoneOff,
   Copy,
   Users,
-  ArrowLeftRight,
-  Phone,
+  ShieldCheck,
+  Loader2,
 } from "lucide-react";
 
 export default function Room() {
   const { roomId } = useParams<{ roomId: string }>();
-  const [, navigate] = useLocation();
+  const [, setLocation] = useLocation();
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const socketRef = useRef<Socket | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
+  const remoteUserIdRef = useRef<string | null>(null);
 
-  const [isConnected, setIsConnected] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
+  const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
+  const [permissionError, setPermissionError] = useState(false);
 
+  // WhatsApp-style swap: false = remote is main, true = local is main
   const [isSwapped, setIsSwapped] = useState(false);
+
+  // Draggable PiP state
   const [pipPosition, setPipPosition] = useState({ x: 16, y: 80 });
   const dragging = useRef(false);
   const dragOffset = useRef({ x: 0, y: 0 });
-  const pipRef = useRef<HTMLDivElement>(null);
-  const wasDragged = useRef(false);
+
+  const { data: room, isLoading: isLoadingRoom, isError: isRoomError } = useGetRoom(roomId);
 
   useEffect(() => {
-    let stream: MediaStream | null = null;
-    const startCamera = async () => {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        localStreamRef.current = stream;
-        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-      } catch (err) {
-        toast.error("Could not access camera/microphone");
-      }
-    };
-    startCamera();
-    return () => { stream?.getTracks().forEach((t) => t.stop()); };
-  }, []);
-
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (localStreamRef.current && remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = localStreamRef.current;
-        setIsConnected(true);
-        toast.success("Partner connected!");
-      }
-    }, 8000);
-    return () => clearTimeout(timer);
-  }, []);
-
-  const toggleMute = useCallback(() => {
-    const stream = localStreamRef.current;
-    if (stream) {
-      stream.getAudioTracks().forEach((t) => (t.enabled = !t.enabled));
-      setIsMuted((m) => !m);
+    if (isRoomError) {
+      toast.error("Room not found");
+      setLocation("/");
     }
-  }, []);
+  }, [isRoomError, setLocation]);
 
-  const toggleVideo = useCallback(() => {
-    const stream = localStreamRef.current;
-    if (stream) {
-      stream.getVideoTracks().forEach((t) => (t.enabled = !t.enabled));
-      setIsVideoOff((v) => !v);
-    }
-  }, []);
-
-  const leaveCall = useCallback(() => {
-    localStreamRef.current?.getTracks().forEach((t) => t.stop());
-    navigate("/");
-  }, [navigate]);
-
-  const copyLink = useCallback(() => {
-    navigator.clipboard.writeText(window.location.href);
-    toast.success("Room link copied!");
-  }, []);
-
+  // --- Draggable PiP handlers ---
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     dragging.current = true;
-    wasDragged.current = false;
-    dragOffset.current = { x: e.clientX - pipPosition.x, y: e.clientY - pipPosition.y };
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-  }, [pipPosition]);
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    dragOffset.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }, []);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     if (!dragging.current) return;
-    wasDragged.current = true;
-    const maxX = window.innerWidth - 130;
-    const maxY = window.innerHeight - 180;
-    setPipPosition({
-      x: Math.max(8, Math.min(e.clientX - dragOffset.current.x, maxX)),
-      y: Math.max(8, Math.min(e.clientY - dragOffset.current.y, maxY)),
-    });
+    const parent = (e.currentTarget as HTMLElement).parentElement;
+    if (!parent) return;
+    const parentRect = parent.getBoundingClientRect();
+    const elW = (e.currentTarget as HTMLElement).offsetWidth;
+    const elH = (e.currentTarget as HTMLElement).offsetHeight;
+    let newX = e.clientX - parentRect.left - dragOffset.current.x;
+    let newY = e.clientY - parentRect.top - dragOffset.current.y;
+    // Clamp within parent
+    newX = Math.max(8, Math.min(newX, parentRect.width - elW - 8));
+    newY = Math.max(8, Math.min(newY, parentRect.height - elH - 8));
+    setPipPosition({ x: newX, y: newY });
   }, []);
 
-  const handlePointerUp = useCallback(() => { dragging.current = false; }, []);
+  const handlePointerUp = useCallback(() => {
+    dragging.current = false;
+  }, []);
 
   const handlePipTap = useCallback(() => {
-    if (!wasDragged.current && isConnected) setIsSwapped((s) => !s);
-  }, [isConnected]);
+    if (!dragging.current) {
+      setIsSwapped((prev) => !prev);
+    }
+  }, []);
 
-  const mainVideoRef = isConnected
-    ? isSwapped ? localVideoRef : remoteVideoRef
-    : localVideoRef;
+  // --- WebRTC setup (unchanged logic) ---
+  useEffect(() => {
+    if (!roomId) return;
 
-  const pipVideoRef = isConnected
-    ? isSwapped ? remoteVideoRef : localVideoRef
-    : null;
+    const setupMediaAndWebRTC = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        localStreamRef.current = stream;
+
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+        }
+
+        const socket = io({ path: "/socket.io" });
+        socketRef.current = socket;
+
+        const pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+        pcRef.current = pc;
+
+        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+        pc.ontrack = (event) => {
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = event.streams[0];
+            setHasRemoteVideo(true);
+          }
+        };
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate && remoteUserIdRef.current) {
+            socket.emit("ice-candidate", {
+              candidate: event.candidate.toJSON(),
+              to: remoteUserIdRef.current,
+            });
+          }
+        };
+
+        socket.on("user-connected", async (userId: string) => {
+          remoteUserIdRef.current = userId;
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit("offer", { offer, to: userId });
+          } catch (e) {
+            console.error("Error creating offer", e);
+          }
+        });
+
+        socket.on("offer", async ({ offer, from }: { offer: RTCSessionDescriptionInit; from: string }) => {
+          remoteUserIdRef.current = from;
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit("answer", { answer, to: from });
+          } catch (e) {
+            console.error("Error handling offer", e);
+          }
+        });
+
+        socket.on("answer", async ({ answer }: { answer: RTCSessionDescriptionInit }) => {
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(answer));
+          } catch (e) {
+            console.error("Error handling answer", e);
+          }
+        });
+
+        socket.on("ice-candidate", async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
+          try {
+            if (candidate) {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            }
+          } catch (e) {
+            console.error("Error adding ice candidate", e);
+          }
+        });
+
+        socket.on("user-disconnected", () => {
+          setHasRemoteVideo(false);
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = null;
+          }
+          if (pcRef.current) {
+            const senders = pcRef.current.getSenders();
+            senders.forEach((sender) => pcRef.current?.removeTrack(sender));
+            if (localStreamRef.current) {
+              localStreamRef.current
+                .getTracks()
+                .forEach((track) => pcRef.current?.addTrack(track, localStreamRef.current!));
+            }
+          }
+        });
+
+        socket.emit("join-room", roomId);
+      } catch (err) {
+        console.error("Media permission error", err);
+        setPermissionError(true);
+      }
+    };
+
+    setupMediaAndWebRTC();
+
+    return () => {
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      pcRef.current?.close();
+      socketRef.current?.disconnect();
+    };
+  }, [roomId]);
+
+  const toggleMute = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = !track.enabled;
+      });
+      setIsMuted(!isMuted);
+    }
+  };
+
+  const toggleVideo = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getVideoTracks().forEach((track) => {
+        track.enabled = !track.enabled;
+      });
+      setIsVideoOff(!isVideoOff);
+    }
+  };
+
+  const copyLink = () => {
+    navigator.clipboard.writeText(window.location.href);
+    toast.success("Link copied to clipboard!");
+  };
+
+  const leaveCall = () => {
+    setLocation("/");
+  };
+
+  // Loading state
+  if (isLoadingRoom) {
+    return (
+      <div style={{
+        minHeight: "100vh",
+        background: "#0a0a0f",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      }}>
+        <Loader2 className="w-8 h-8 animate-spin" style={{ color: "#7c5cfc" }} />
+      </div>
+    );
+  }
+
+  // Permission error state
+  if (permissionError) {
+    return (
+      <div style={{
+        minHeight: "100vh",
+        background: "#0a0a0f",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "24px",
+      }}>
+        <div style={{
+          background: "rgba(124,92,252,0.08)",
+          border: "1px solid rgba(124,92,252,0.2)",
+          borderRadius: "20px",
+          padding: "32px",
+          textAlign: "center",
+          maxWidth: "400px",
+          width: "100%",
+        }}>
+          <div style={{
+            width: "64px",
+            height: "64px",
+            borderRadius: "50%",
+            background: "rgba(239,68,68,0.15)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            margin: "0 auto 16px",
+          }}>
+            <VideoOff style={{ color: "#ef4444", width: "28px", height: "28px" }} />
+          </div>
+          <h2 style={{ color: "#fff", fontSize: "20px", fontWeight: 700, marginBottom: "8px" }}>
+            Camera/Microphone Access Denied
+          </h2>
+          <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "14px", lineHeight: 1.6 }}>
+            We need access to your camera and microphone for the video call. Please allow access in your browser settings and refresh the page.
+          </p>
+          <Button
+            onClick={() => window.location.reload()}
+            style={{
+              width: "100%",
+              marginTop: "16px",
+              background: "linear-gradient(135deg, #7c5cfc, #6c47ff)",
+              border: "none",
+              borderRadius: "12px",
+              color: "#fff",
+              fontWeight: 600,
+              padding: "12px",
+              cursor: "pointer",
+            }}
+          >
+            Try Again
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // Determine which video goes where
+  const mainVideoRef = isSwapped ? localVideoRef : remoteVideoRef;
+  const pipVideoRef = isSwapped ? remoteVideoRef : localVideoRef;
+  const mainLabel = isSwapped ? "You" : "";
+  const pipLabel = isSwapped ? "" : "You";
+  const showWaiting = !hasRemoteVideo && !isSwapped;
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden bg-[hsl(240,20%,4%)] select-none">
-      <video
-        ref={mainVideoRef}
-        autoPlay
-        playsInline
-        muted={mainVideoRef === localVideoRef}
-        className="absolute inset-0 h-full w-full object-cover"
-      />
-      <div className="absolute inset-0 bg-black/10 pointer-events-none" />
-
-      <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between px-4 pt-3 pb-2">
-        <div className="flex items-center gap-2">
-          {!isConnected ? (
-            <>
-              <Phone className="w-4 h-4 text-green-400 animate-pulse" />
-              <span className="text-sm font-medium text-white/90 drop-shadow">Calling…</span>
-            </>
-          ) : (
-            <>
-              <div className="w-2 h-2 rounded-full bg-green-400" />
-              <span className="text-sm font-medium text-white/90 drop-shadow">Connected</span>
-            </>
-          )}
+    <div style={{
+      minHeight: "100vh",
+      background: "#0a0a0f",
+      display: "flex",
+      flexDirection: "column",
+      position: "relative",
+      overflow: "hidden",
+    }}>
+      {/* Top Bar */}
+      <div style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
+        zIndex: 30,
+        padding: "12px 16px",
+        background: "linear-gradient(180deg, rgba(0,0,0,0.7) 0%, transparent 100%)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <div style={{
+            width: "36px",
+            height: "36px",
+            borderRadius: "10px",
+            background: "linear-gradient(135deg, #7c5cfc, #6c47ff)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}>
+            <VideoIcon style={{ color: "#fff", width: "18px", height: "18px" }} />
+          </div>
+          <div>
+            <p style={{ color: "#fff", fontSize: "14px", fontWeight: 600, margin: 0 }}>
+              Room {room?.id?.substring(0, 8)}
+            </p>
+            <p style={{ color: "rgba(255,255,255,0.4)", fontSize: "11px", margin: 0, display: "flex", alignItems: "center", gap: "4px" }}>
+              <ShieldCheck style={{ width: "10px", height: "10px" }} />
+              End-to-end encrypted
+            </p>
+          </div>
         </div>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8 text-white/80 hover:text-white hover:bg-white/10"
-          onClick={copyLink}
-        >
-          <Copy className="w-4 h-4" />
-        </Button>
+
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <div style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "4px",
+            background: "rgba(255,255,255,0.1)",
+            borderRadius: "20px",
+            padding: "4px 10px",
+            fontSize: "12px",
+            color: "rgba(255,255,255,0.7)",
+          }}>
+            <Users style={{ width: "12px", height: "12px" }} />
+            {hasRemoteVideo ? "2" : "1"}
+          </div>
+          <button
+            onClick={copyLink}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "4px",
+              background: "rgba(255,255,255,0.1)",
+              border: "none",
+              borderRadius: "20px",
+              padding: "6px 12px",
+              fontSize: "12px",
+              color: "rgba(255,255,255,0.7)",
+              cursor: "pointer",
+            }}
+          >
+            <Copy style={{ width: "12px", height: "12px" }} />
+            Copy Link
+          </button>
+        </div>
       </div>
 
-      {isConnected && pipVideoRef && (
+      {/* Main Video (full screen) */}
+      <div style={{
+        flex: 1,
+        position: "relative",
+        width: "100%",
+        height: "100%",
+      }}>
+        {/* Main video element */}
+        <video
+          ref={mainVideoRef}
+          autoPlay
+          playsInline
+          muted={isSwapped}
+          style={{
+            width: "100%",
+            height: "100vh",
+            objectFit: "cover",
+            background: "#0a0a0f",
+          }}
+        />
+
+        {/* Waiting overlay (only when remote is main and no remote video) */}
+        {showWaiting && (
+          <div style={{
+            position: "absolute",
+            inset: 0,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(10,10,15,0.85)",
+          }}>
+            <div style={{
+              width: "80px",
+              height: "80px",
+              borderRadius: "50%",
+              background: "rgba(124,92,252,0.15)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              marginBottom: "16px",
+              animation: "pulse 2s ease-in-out infinite",
+            }}>
+              <Users style={{ color: "#7c5cfc", width: "36px", height: "36px" }} />
+            </div>
+            <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "16px" }}>
+              Waiting for others to join...
+            </p>
+          </div>
+        )}
+
+        {/* Main label */}
+        {mainLabel && (
+          <div style={{
+            position: "absolute",
+            bottom: "100px",
+            left: "16px",
+            background: "rgba(0,0,0,0.5)",
+            borderRadius: "8px",
+            padding: "4px 10px",
+            color: "#fff",
+            fontSize: "12px",
+            fontWeight: 600,
+          }}>
+            {mainLabel}
+          </div>
+        )}
+
+        {/* PiP Video (draggable + tappable to swap) */}
         <div
-          ref={pipRef}
-          className="absolute z-30 w-[120px] h-[160px] rounded-2xl overflow-hidden shadow-2xl border-2 border-white/20 cursor-grab active:cursor-grabbing"
-          style={{ left: pipPosition.x, top: pipPosition.y, touchAction: "none" }}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onClick={handlePipTap}
+          style={{
+            position: "absolute",
+            left: `${pipPosition.x}px`,
+            top: `${pipPosition.y}px`,
+            width: "120px",
+            height: "160px",
+            borderRadius: "16px",
+            overflow: "hidden",
+            border: "2px solid rgba(124,92,252,0.4)",
+            boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+            cursor: "grab",
+            zIndex: 20,
+            touchAction: "none",
+            background: "#1a1a2e",
+          }}
         >
           <video
             ref={pipVideoRef}
             autoPlay
             playsInline
-            muted={pipVideoRef === localVideoRef}
-            className="h-full w-full object-cover"
+            muted={!isSwapped}
+            style={{
+              width: "100%",
+              height: "100%",
+              objectFit: "cover",
+              transform: !isSwapped ? "scaleX(-1)" : "none",
+            }}
           />
-          <div className="absolute bottom-1 right-1 rounded-full bg-black/50 p-1">
-            <ArrowLeftRight className="w-3 h-3 text-white/70" />
-          </div>
-          <div className="absolute top-1 left-1.5 text-[10px] font-medium text-white/80 drop-shadow">
-            {pipVideoRef === localVideoRef ? "You" : "Partner"}
-          </div>
-        </div>
-      )}
 
-      {isVideoOff && mainVideoRef === localVideoRef && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-[hsl(240,20%,8%)]">
-          <div className="w-20 h-20 rounded-full bg-white/10 flex items-center justify-center">
-            <VideoOff className="w-8 h-8 text-white/50" />
+          {/* PiP label */}
+          <div style={{
+            position: "absolute",
+            bottom: "6px",
+            left: "6px",
+            background: "rgba(0,0,0,0.6)",
+            borderRadius: "6px",
+            padding: "2px 8px",
+            color: "#fff",
+            fontSize: "10px",
+            fontWeight: 600,
+          }}>
+            {pipLabel}
           </div>
-        </div>
-      )}
 
-      <div className="absolute bottom-0 inset-x-0 z-20 pb-8 pt-4 flex justify-center">
-        <div className="flex items-center gap-4 px-6 py-3 rounded-full bg-black/40 backdrop-blur-xl border border-white/10">
-          <Button
-            variant="ghost"
-            size="icon"
-            className={`h-12 w-12 rounded-full ${isMuted ? "bg-red-500/20 text-red-400 hover:bg-red-500/30" : "bg-white/10 text-white hover:bg-white/20"}`}
-            onClick={toggleMute}
-          >
-            {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className={`h-12 w-12 rounded-full ${isVideoOff ? "bg-red-500/20 text-red-400 hover:bg-red-500/30" : "bg-white/10 text-white hover:bg-white/20"}`}
-            onClick={toggleVideo}
-          >
-            {isVideoOff ? <VideoOff className="w-5 h-5" /> : <VideoIcon className="w-5 h-5" />}
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-14 w-14 rounded-full bg-red-500 text-white hover:bg-red-600"
-            onClick={leaveCall}
-          >
-            <PhoneOff className="w-6 h-6" />
-          </Button>
+          {/* Swap hint icon */}
+          <div style={{
+            position: "absolute",
+            top: "6px",
+            right: "6px",
+            width: "22px",
+            height: "22px",
+            borderRadius: "50%",
+            background: "rgba(124,92,252,0.6)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4" />
+            </svg>
+          </div>
+
+          {/* Video off overlay for PiP */}
+          {isVideoOff && !isSwapped && (
+            <div style={{
+              position: "absolute",
+              inset: 0,
+              background: "rgba(10,10,15,0.9)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}>
+              <VideoOff style={{ color: "rgba(255,255,255,0.3)", width: "24px", height: "24px" }} />
+            </div>
+          )}
+
+          {/* Muted indicator for PiP */}
+          {isMuted && !isSwapped && (
+            <div style={{
+              position: "absolute",
+              top: "6px",
+              left: "6px",
+              width: "20px",
+              height: "20px",
+              borderRadius: "50%",
+              background: "rgba(239,68,68,0.8)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}>
+              <MicOff style={{ width: "10px", height: "10px", color: "#fff" }} />
+            </div>
+          )}
         </div>
       </div>
+
+      {/* Control Bar */}
+      <div style={{
+        position: "absolute",
+        bottom: 0,
+        left: 0,
+        right: 0,
+        zIndex: 30,
+        padding: "16px 24px 32px",
+        background: "linear-gradient(0deg, rgba(0,0,0,0.8) 0%, transparent 100%)",
+        display: "flex",
+        justifyContent: "center",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          <button
+            onClick={toggleMute}
+            style={{
+              width: "52px",
+              height: "52px",
+              borderRadius: "50%",
+              border: "none",
+              background: isMuted ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)",
+              color: isMuted ? "#ef4444" : "#fff",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              backdropFilter: "blur(12px)",
+            }}
+          >
+            {isMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+          </button>
+
+          <button
+            onClick={toggleVideo}
+            style={{
+              width: "52px",
+              height: "52px",
+              borderRadius: "50%",
+              border: "none",
+              background: isVideoOff ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)",
+              color: isVideoOff ? "#ef4444" : "#fff",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              cursor: "pointer",
+              backdropFilter: "blur(12px)",
+            }}
+          >
+            {isVideoOff ? <VideoOff className="w-5 h-5" /> : <VideoIcon className="w-5 h-5" />}
+          </button>
+
+          <button
+            onClick={leaveCall}
+            style={{
+              height: "52px",
+              borderRadius: "26px",
+              border: "none",
+              background: "linear-gradient(135deg, #ef4444, #dc2626)",
+              color: "#fff",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: "8px",
+              padding: "0 24px",
+              cursor: "pointer",
+              fontWeight: 600,
+              fontSize: "14px",
+              boxShadow: "0 4px 20px rgba(239,68,68,0.4)",
+            }}
+          >
+            <PhoneOff className="w-5 h-5" />
+            Leave
+          </button>
+        </div>
+      </div>
+
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { transform: scale(1); opacity: 1; }
+          50% { transform: scale(1.08); opacity: 0.7; }
+        }
+      `}</style>
     </div>
   );
 }
