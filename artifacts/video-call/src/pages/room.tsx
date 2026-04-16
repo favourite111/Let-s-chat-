@@ -67,7 +67,6 @@ export default function Room() {
     const elH = (e.currentTarget as HTMLElement).offsetHeight;
     let newX = e.clientX - parentRect.left - dragOffset.current.x;
     let newY = e.clientY - parentRect.top - dragOffset.current.y;
-    // Clamp within parent
     newX = Math.max(8, Math.min(newX, parentRect.width - elW - 8));
     newY = Math.max(8, Math.min(newY, parentRect.height - elH - 8));
     setPipPosition({ x: newX, y: newY });
@@ -83,7 +82,7 @@ export default function Room() {
     }
   }, []);
 
-  // --- WebRTC setup (unchanged logic) ---
+  // --- WebRTC setup ---
   useEffect(() => {
     if (!roomId) return;
 
@@ -225,7 +224,6 @@ export default function Room() {
     setLocation("/");
   };
 
-  // Loading state
   if (isLoadingRoom) {
     return (
       <div style={{
@@ -240,7 +238,6 @@ export default function Room() {
     );
   }
 
-  // Permission error state
   if (permissionError) {
     return (
       <div style={{
@@ -299,12 +296,30 @@ export default function Room() {
     );
   }
 
-  // Determine which video goes where
-  const mainVideoRef = isSwapped ? localVideoRef : remoteVideoRef;
-  const pipVideoRef = isSwapped ? remoteVideoRef : localVideoRef;
-  const mainLabel = isSwapped ? "You" : "";
-  const pipLabel = isSwapped ? "" : "You";
   const showWaiting = !hasRemoteVideo && !isSwapped;
+
+  // Shared PiP wrapper style
+  const pipWrapperStyle: React.CSSProperties = {
+    position: "absolute",
+    left: `${pipPosition.x}px`,
+    top: `${pipPosition.y}px`,
+    width: "120px",
+    height: "160px",
+    borderRadius: "16px",
+    overflow: "hidden",
+    border: "2px solid rgba(124,92,252,0.4)",
+    boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+    cursor: "grab",
+    zIndex: 20,
+    touchAction: "none",
+    background: "#1a1a2e",
+  };
+
+  // Shared main wrapper style
+  const mainWrapperStyle: React.CSSProperties = {
+    position: "absolute",
+    inset: 0,
+  };
 
   return (
     <div style={{
@@ -386,28 +401,142 @@ export default function Room() {
         </div>
       </div>
 
-      {/* Main Video (full screen) */}
-      <div style={{
-        flex: 1,
-        position: "relative",
-        width: "100%",
-        height: "100%",
-      }}>
-        {/* Main video element */}
-        <video
-          ref={mainVideoRef}
-          autoPlay
-          playsInline
-          muted={isSwapped}
-          style={{
-            width: "100%",
-            height: "100vh",
-            objectFit: "cover",
-            background: "#0a0a0f",
-          }}
-        />
+      {/* Video Area */}
+      <div style={{ flex: 1, position: "relative", width: "100%", height: "100%" }}>
 
-        {/* Waiting overlay (only when remote is main and no remote video) */}
+        {/* Remote video — main when !isSwapped, PiP when isSwapped */}
+        <div
+          onPointerDown={isSwapped ? handlePointerDown : undefined}
+          onPointerMove={isSwapped ? handlePointerMove : undefined}
+          onPointerUp={isSwapped ? handlePointerUp : undefined}
+          onClick={isSwapped ? handlePipTap : undefined}
+          style={isSwapped ? pipWrapperStyle : mainWrapperStyle}
+        >
+          <video
+            ref={remoteVideoRef}
+            autoPlay
+            playsInline
+            style={{
+              width: "100%",
+              height: isSwapped ? "100%" : "100vh",
+              objectFit: "cover",
+              background: "#0a0a0f",
+            }}
+          />
+          {/* Swap hint icon — only visible when remote is in PiP */}
+          {isSwapped && (
+            <div style={{
+              position: "absolute",
+              top: "6px",
+              right: "6px",
+              width: "22px",
+              height: "22px",
+              borderRadius: "50%",
+              background: "rgba(124,92,252,0.6)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4" />
+              </svg>
+            </div>
+          )}
+        </div>
+
+        {/* Local video — PiP when !isSwapped, main when isSwapped */}
+        {/* ref is always fixed to localVideoRef — never swapped */}
+        <div
+          onPointerDown={!isSwapped ? handlePointerDown : undefined}
+          onPointerMove={!isSwapped ? handlePointerMove : undefined}
+          onPointerUp={!isSwapped ? handlePointerUp : undefined}
+          onClick={!isSwapped ? handlePipTap : undefined}
+          style={!isSwapped ? pipWrapperStyle : mainWrapperStyle}
+        >
+          <video
+            ref={localVideoRef}
+            autoPlay
+            playsInline
+            muted
+            style={{
+              width: "100%",
+              height: !isSwapped ? "100%" : "100vh",
+              objectFit: "cover",
+              background: "#0a0a0f",
+              transform: "scaleX(-1)", // always mirror local camera
+            }}
+          />
+
+          {/* "You" label — always follows local video */}
+          <div style={{
+            position: "absolute",
+            bottom: isSwapped ? "100px" : "6px",
+            left: isSwapped ? "16px" : "6px",
+            background: "rgba(0,0,0,0.6)",
+            borderRadius: "6px",
+            padding: "2px 8px",
+            color: "#fff",
+            fontSize: isSwapped ? "12px" : "10px",
+            fontWeight: 600,
+            zIndex: 1,
+          }}>
+            You
+          </div>
+
+          {/* Swap hint icon — only visible when local is in PiP */}
+          {!isSwapped && (
+            <div style={{
+              position: "absolute",
+              top: "6px",
+              right: "6px",
+              width: "22px",
+              height: "22px",
+              borderRadius: "50%",
+              background: "rgba(124,92,252,0.6)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4" />
+              </svg>
+            </div>
+          )}
+
+          {/* Video off overlay — always tied to local stream */}
+          {isVideoOff && (
+            <div style={{
+              position: "absolute",
+              inset: 0,
+              background: "rgba(10,10,15,0.9)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}>
+              <VideoOff style={{ color: "rgba(255,255,255,0.3)", width: "24px", height: "24px" }} />
+            </div>
+          )}
+
+          {/* Muted indicator — always tied to local stream */}
+          {isMuted && (
+            <div style={{
+              position: "absolute",
+              top: "6px",
+              left: "6px",
+              width: "20px",
+              height: "20px",
+              borderRadius: "50%",
+              background: "rgba(239,68,68,0.8)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}>
+              <MicOff style={{ width: "10px", height: "10px", color: "#fff" }} />
+            </div>
+          )}
+        </div>
+
+        {/* Waiting overlay — shown over remote (main) when no one has joined yet */}
         {showWaiting && (
           <div style={{
             position: "absolute",
@@ -417,6 +546,7 @@ export default function Room() {
             alignItems: "center",
             justifyContent: "center",
             background: "rgba(10,10,15,0.85)",
+            zIndex: 10,
           }}>
             <div style={{
               width: "80px",
@@ -436,124 +566,6 @@ export default function Room() {
             </p>
           </div>
         )}
-
-        {/* Main label */}
-        {mainLabel && (
-          <div style={{
-            position: "absolute",
-            bottom: "100px",
-            left: "16px",
-            background: "rgba(0,0,0,0.5)",
-            borderRadius: "8px",
-            padding: "4px 10px",
-            color: "#fff",
-            fontSize: "12px",
-            fontWeight: 600,
-          }}>
-            {mainLabel}
-          </div>
-        )}
-
-        {/* PiP Video (draggable + tappable to swap) */}
-        <div
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp}
-          onClick={handlePipTap}
-          style={{
-            position: "absolute",
-            left: `${pipPosition.x}px`,
-            top: `${pipPosition.y}px`,
-            width: "120px",
-            height: "160px",
-            borderRadius: "16px",
-            overflow: "hidden",
-            border: "2px solid rgba(124,92,252,0.4)",
-            boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-            cursor: "grab",
-            zIndex: 20,
-            touchAction: "none",
-            background: "#1a1a2e",
-          }}
-        >
-          <video
-            ref={pipVideoRef}
-            autoPlay
-            playsInline
-            muted={!isSwapped}
-            style={{
-              width: "100%",
-              height: "100%",
-              objectFit: "cover",
-              transform: !isSwapped ? "scaleX(-1)" : "none",
-            }}
-          />
-
-          {/* PiP label */}
-          <div style={{
-            position: "absolute",
-            bottom: "6px",
-            left: "6px",
-            background: "rgba(0,0,0,0.6)",
-            borderRadius: "6px",
-            padding: "2px 8px",
-            color: "#fff",
-            fontSize: "10px",
-            fontWeight: 600,
-          }}>
-            {pipLabel}
-          </div>
-
-          {/* Swap hint icon */}
-          <div style={{
-            position: "absolute",
-            top: "6px",
-            right: "6px",
-            width: "22px",
-            height: "22px",
-            borderRadius: "50%",
-            background: "rgba(124,92,252,0.6)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}>
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4" />
-            </svg>
-          </div>
-
-          {/* Video off overlay for PiP */}
-          {isVideoOff && !isSwapped && (
-            <div style={{
-              position: "absolute",
-              inset: 0,
-              background: "rgba(10,10,15,0.9)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}>
-              <VideoOff style={{ color: "rgba(255,255,255,0.3)", width: "24px", height: "24px" }} />
-            </div>
-          )}
-
-          {/* Muted indicator for PiP */}
-          {isMuted && !isSwapped && (
-            <div style={{
-              position: "absolute",
-              top: "6px",
-              left: "6px",
-              width: "20px",
-              height: "20px",
-              borderRadius: "50%",
-              background: "rgba(239,68,68,0.8)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}>
-              <MicOff style={{ width: "10px", height: "10px", color: "#fff" }} />
-            </div>
-          )}
-        </div>
       </div>
 
       {/* Control Bar */}
