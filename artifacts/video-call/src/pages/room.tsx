@@ -83,35 +83,14 @@ export default function Room() {
   }, []);
 
   // --- WebRTC setup ---
-   useEffect(() => {
+
+useEffect(() => {
   if (!roomId) return;
-  const iceCandidateBuffer: RTCIceCandidateInit[] = [];
+
+  let iceCandidateBuffer: RTCIceCandidateInit[] = [];
   let remoteDescSet = false;
-  const flushCandidates = async (pc: RTCPeerConnection) => {
-    remoteDescSet = true;
-    for (const c of iceCandidateBuffer) {
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(c));
-      } catch (e) {
-        console.error("Error flushing ice candidate", e);
-      }
-    }
-    iceCandidateBuffer.length = 0;
-  };
-  const setupMediaAndWebRTC = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
-      });
-      localStreamRef.current = stream;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
-      const socket = io({ path: "/socket.io" });
-      socketRef.current = socket;
-      const pc = new RTCPeerConnection({
-  iceServers: [
+
+  const ICE_SERVERS = [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     {
@@ -129,26 +108,82 @@ export default function Room() {
       username: "openrelayproject",
       credential: "openrelayproject",
     },
-  ],
-});
-      pcRef.current = pc;
-      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-      pc.ontrack = (event) => {
-        if (remoteVideoRef.current) {
-          remoteVideoRef.current.srcObject = event.streams[0];
-          setHasRemoteVideo(true);
-        }
-      };
-      pc.onicecandidate = (event) => {
-        if (event.candidate && remoteUserIdRef.current) {
-          socket.emit("ice-candidate", {
-            candidate: event.candidate.toJSON(),
-            to: remoteUserIdRef.current,
-          });
-        }
-      };
+  ];
+
+  const createPC = (socket: Socket) => {
+    // Close any existing connection first
+    if (pcRef.current) {
+      pcRef.current.ontrack = null;
+      pcRef.current.onicecandidate = null;
+      pcRef.current.close();
+    }
+
+    iceCandidateBuffer = [];
+    remoteDescSet = false;
+
+    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pcRef.current = pc;
+
+    // Add local tracks to the new PC
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((track) => {
+        pc.addTrack(track, localStreamRef.current!);
+      });
+    }
+
+    pc.ontrack = (event) => {
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = event.streams[0];
+        setHasRemoteVideo(true);
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate && remoteUserIdRef.current) {
+        socket.emit("ice-candidate", {
+          candidate: event.candidate.toJSON(),
+          to: remoteUserIdRef.current,
+        });
+      }
+    };
+
+    return pc;
+  };
+
+  const flushCandidates = async (pc: RTCPeerConnection) => {
+    remoteDescSet = true;
+    for (const c of iceCandidateBuffer) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(c));
+      } catch (e) {
+        console.error("Error flushing ICE candidate", e);
+      }
+    }
+    iceCandidateBuffer = [];
+  };
+
+  const setupMediaAndWebRTC = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      localStreamRef.current = stream;
+
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+
+      const socket = io({ path: "/socket.io" });
+      socketRef.current = socket;
+
+      // Create the initial peer connection
+      let pc = createPC(socket);
+
       socket.on("user-connected", async (userId: string) => {
         remoteUserIdRef.current = userId;
+        // Always create a fresh PC when a new user joins
+        pc = createPC(socket);
         try {
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
@@ -157,11 +192,12 @@ export default function Room() {
           console.error("Error creating offer", e);
         }
       });
+
       socket.on("offer", async ({ offer, from }: { offer: RTCSessionDescriptionInit; from: string }) => {
         remoteUserIdRef.current = from;
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(offer));
-          await flushCandidates(pc); // apply any buffered candidates
+          await flushCandidates(pc);
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
           socket.emit("answer", { answer, to: from });
@@ -169,56 +205,55 @@ export default function Room() {
           console.error("Error handling offer", e);
         }
       });
+
       socket.on("answer", async ({ answer }: { answer: RTCSessionDescriptionInit }) => {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(answer));
-          await flushCandidates(pc); // apply any buffered candidates
+          await flushCandidates(pc);
         } catch (e) {
           console.error("Error handling answer", e);
         }
       });
+
       socket.on("ice-candidate", async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
         if (!candidate) return;
         if (remoteDescSet) {
           try {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
           } catch (e) {
-            console.error("Error adding ice candidate", e);
+            console.error("Error adding ICE candidate", e);
           }
         } else {
-          // Buffer it until remote description is ready
           iceCandidateBuffer.push(candidate);
         }
       });
+
       socket.on("user-disconnected", () => {
         setHasRemoteVideo(false);
+        remoteUserIdRef.current = null;
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = null;
         }
-        if (pcRef.current) {
-          const senders = pcRef.current.getSenders();
-          senders.forEach((sender) => pcRef.current?.removeTrack(sender));
-          if (localStreamRef.current) {
-            localStreamRef.current
-              .getTracks()
-              .forEach((track) => pcRef.current?.addTrack(track, localStreamRef.current!));
-          }
-        }
+        // Create a fresh PC ready for the next person who joins
+        pc = createPC(socket);
       });
+
       socket.emit("join-room", roomId);
     } catch (err) {
       console.error("Media permission error", err);
       setPermissionError(true);
     }
   };
+
   setupMediaAndWebRTC();
+
   return () => {
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     pcRef.current?.close();
     socketRef.current?.disconnect();
   };
 }, [roomId]);
-      
+  
   const toggleMute = () => {
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach((track) => {
