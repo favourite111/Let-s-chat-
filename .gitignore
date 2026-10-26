@@ -47,3 +47,9 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# SQLite room database (created on first run)
+data/
+*.db
+*.db-wal
+*.db-shm

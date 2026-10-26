@@ -14,7 +14,8 @@
 
 | File | Responsibility |
 |---|---|
-| `src/lib/rooms.ts` | Room store: creation, join/leave, live participant counts, TTL sweep, capacity cap |
+| `src/lib/rooms.ts` | Room service: creation, join/leave, live participant counts, TTL sweep, capacity cap |
+| `src/lib/store/*` | Pluggable persistence: `sqlite` (default), `postgres`, `memory`; presence in memory or Redis |
 | `src/lib/signaling.ts` | Validated Socket.IO relay; enforces room membership and per-socket rate limits |
 | `src/routes/rooms.ts` | REST endpoints, Zod validation from the OpenAPI contract |
 | `src/routes/ice.ts` | TURN/STUN config from environment |
@@ -23,15 +24,29 @@
 
 Every inbound socket payload is validated before use and each handler is wrapped, so a malformed message can no longer take the process down (`test/smoke.test.mjs` covers this).
 
+## Storage model
+
+Two kinds of state, deliberately separated:
+
+| State | Nature | Default | Upgrade |
+|---|---|---|---|
+| **Rooms** (`id`, host, timestamps) | durable — must survive a restart | SQLite file (`SQLITE_PATH`) with WAL | Postgres via `DATABASE_URL` |
+| **Presence** (socket ids in a room) | ephemeral — meaningless after a restart | in-process memory | Redis via `REDIS_URL` |
+
+`STORE=auto` (default) picks Postgres when `DATABASE_URL` is present, SQLite otherwise. Because the durable part is a single small table, SQLite is genuinely sufficient for a VPS: no daemon to run, no backup tooling beyond copying one file. `lib/store/index.ts` resolves the backend and logs which one won.
+
+An **explicitly configured** `SQLITE_PATH` that cannot be opened is a hard startup error — better than booting into a silent in-memory fallback and losing rooms on the next restart. Only the *default* path may fall back (so `pnpm dev` works anywhere).
+
 ## Deliberate limitations
 
-**No horizontal scaling.** Rooms and socket membership live in process memory. Two instances would see different room tables and could not relay between them. `render.yaml` pins `numInstances: 1`. To scale:
+**Single instance by default.** With SQLite + memory presence, two processes would see different presence and could not relay between them. `render.yaml` pins `numInstances: 1`, and `docker-compose.yml` runs one container. To scale:
 
-- move rooms to Postgres (the `lib/db` Drizzle package is scaffolded for exactly this),
-- add `@socket.io/redis-adapter` plus sticky sessions so a room's sockets share one replica,
-- keep TURN credentials out of the client and issue short-lived ones per session.
+- set `DATABASE_URL` (rooms) **and** `REDIS_URL` (presence),
+- the Socket.IO Redis adapter is attached automatically when `REDIS_URL` is set,
+- add sticky sessions (`ip_hash` in nginx) so a room's sockets land on one replica,
+- issue short-lived TURN credentials per session instead of static ones.
 
-**Rooms do not survive a restart.** Empty rooms are swept after 2 hours; a redeploy drops every active room.
+**Restarts drop live calls, not rooms.** Room records persist; the WebRTC sessions they describe do not, which is correct — peers reconnect and re-join the same room id.
 
 **Not verified end-to-end encryption.** WebRTC always encrypts media in transit (DTLS-SRTP), so the UI says *"Encrypted in transit"*, not "end-to-end". True E2EE with tamper-evident signalling requires identity keys exchanged out-of-band and fingerprint comparison — those are unauthenticated right now, so a compromised signalling server could MITM a call.
 

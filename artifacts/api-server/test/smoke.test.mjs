@@ -1,11 +1,15 @@
 /**
  * Integration tests for the API + signaling server.
  *
- * These are regression tests for the bugs found in the audit:
- *   - a null payload used to crash the process  (P0-1)
- *   - any string used to be a valid room        (P0-2)
- *   - participantCount was always 0             (P1-7)
- *   - unknown /api routes returned the SPA HTML (P2)
+ * Regression tests for the bugs found in the audit:
+ *   - a null payload used to crash the process      (P0-1)
+ *   - any string used to be a valid room            (P0-2)
+ *   - participantCount was always 0                 (P1-7)
+ *   - unknown /api routes returned the SPA HTML     (P2)
+ *
+ * Plus storage coverage:
+ *   - rooms are written to SQLite and survive a restart
+ *   - the sweeper reclaims empty rooms past the TTL
  *
  * Run with: pnpm --filter @workspace/api-server test
  * (Requires `pnpm --filter @workspace/api-server build` first.)
@@ -14,16 +18,21 @@ import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
-import { io } from "socket.io-client";
+import { mkdtempSync, rmSync, existsSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { io } from "socket.io-client";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverEntry = path.resolve(here, "..", "dist", "index.mjs");
 const PORT = 4599;
 const BASE = `http://127.0.0.1:${PORT}`;
 
-let child;
+const dataDir = mkdtempSync(path.join(tmpdir(), "videocall-test-"));
+const sqlitePath = path.join(dataDir, "rooms.db");
+
+let child = null;
 const sockets = [];
 
 function connect() {
@@ -42,6 +51,45 @@ function once(socket, event, timeoutMs = 3000) {
   });
 }
 
+async function startServer(extraEnv = {}) {
+  const proc = spawn(process.execPath, [serverEntry], {
+    env: {
+      ...process.env,
+      NODE_ENV: "production",
+      PORT: String(PORT),
+      // Explicit and isolated: every test run gets its own database file.
+      STORE: "sqlite",
+      SQLITE_PATH: sqlitePath,
+      ROOM_CREATE_LIMIT_PER_MINUTE: "10000",
+      RATE_LIMIT_PER_MINUTE: "100000",
+      ...extraEnv,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  proc.stderr.on("data", (chunk) => process.stderr.write(`[server] ${chunk}`));
+
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(`${BASE}/api/healthz`);
+      if (res.ok) return proc;
+    } catch {
+      /* not up yet */
+    }
+    await delay(150);
+  }
+  throw new Error("Server did not start in time");
+}
+
+async function stopServer(proc) {
+  if (!proc) return;
+  const exited = new Promise((resolve) => proc.once("exit", resolve));
+  proc.kill("SIGTERM");
+  await Promise.race([exited, delay(5000)]);
+  if (proc.exitCode === null) proc.kill("SIGKILL");
+  await delay(150);
+}
+
 async function createRoom(hostName) {
   const res = await fetch(`${BASE}/api/rooms`, {
     method: "POST",
@@ -53,46 +101,23 @@ async function createRoom(hostName) {
 }
 
 before(async () => {
-  child = spawn(process.execPath, [serverEntry], {
-    env: {
-      ...process.env,
-      NODE_ENV: "production",
-      PORT: String(PORT),
-      // Keep the limiter out of the way for room-creation tests.
-      ROOM_CREATE_LIMIT_PER_MINUTE: "10000",
-      RATE_LIMIT_PER_MINUTE: "100000",
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stderr.on("data", (chunk) => process.stderr.write(`[server] ${chunk}`));
-
-  const deadline = Date.now() + 20_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${BASE}/api/healthz`);
-      if (res.ok) return;
-    } catch {
-      /* not up yet */
-    }
-    await delay(200);
-  }
-  throw new Error("Server did not start in time");
+  child = await startServer();
 });
 
 after(async () => {
   sockets.forEach((socket) => socket.disconnect());
-  child?.kill("SIGTERM");
-  await delay(300);
-  child?.kill("SIGKILL");
+  await stopServer(child);
+  rmSync(dataDir, { recursive: true, force: true });
 });
 
 describe("REST API", () => {
-  it("reports health", async () => {
+  it("reports health and the active store", async () => {
     const res = await fetch(`${BASE}/api/healthz`);
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.status, "ok");
     assert.equal(typeof body.uptime, "number");
+    assert.equal(typeof body.rooms, "number");
   });
 
   it("creates a room with a 60-bit id", async () => {
@@ -102,10 +127,7 @@ describe("REST API", () => {
     assert.ok(Date.parse(room.createdAt));
   });
 
-  it("returns 404 for an unknown room and 400 for an invalid body", async () => {
-    const missing = await fetch(`${BASE}/api/rooms/doesnotexist`);
-    assert.equal(missing.status, 404);
-
+  it("rejects an invalid body and truncates a long host name", async () => {
     const bad = await fetch(`${BASE}/api/rooms`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -118,8 +140,13 @@ describe("REST API", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ hostName: "x".repeat(500) }),
     });
-    const longRoom = await tooLong.json();
-    assert.ok(longRoom.hostName.length <= 64);
+    const room = await tooLong.json();
+    assert.ok(room.hostName.length <= 64);
+  });
+
+  it("returns 404 for unknown rooms", async () => {
+    const missing = await fetch(`${BASE}/api/rooms/doesnotexist`);
+    assert.equal(missing.status, 404);
   });
 
   it("answers unknown /api routes with JSON, not HTML", async () => {
@@ -142,8 +169,7 @@ describe("Signaling", () => {
     await once(socket, "connect");
     const receipt = once(socket, "join-error");
     socket.emit("join-room", "ghost-room-123");
-    const payload = await receipt;
-    assert.equal(payload.reason, "room-not-found");
+    assert.equal((await receipt).reason, "room-not-found");
   });
 
   it("refuses a third participant", async () => {
@@ -171,8 +197,20 @@ describe("Signaling", () => {
     await once(socket, "room-joined");
 
     const res = await fetch(`${BASE}/api/rooms/${room.id}`);
-    const body = await res.json();
-    assert.equal(body.participantCount, 1, "REST must reflect joined sockets");
+    assert.equal((await res.json()).participantCount, 1, "REST must reflect joined sockets");
+  });
+
+  it("drops the count when the peer leaves", async () => {
+    const room = await createRoom();
+    const socket = connect();
+    await once(socket, "connect");
+    socket.emit("join-room", room.id);
+    await once(socket, "room-joined");
+    socket.disconnect();
+    await delay(400);
+
+    const res = await fetch(`${BASE}/api/rooms/${room.id}`);
+    assert.equal((await res.json()).participantCount, 0);
   });
 
   it("relays offer/answer/ICE only inside a room", async () => {
@@ -192,7 +230,6 @@ describe("Signaling", () => {
     assert.equal(offer.offer.sdp, "x");
     assert.equal(offer.from, a.id);
 
-    // A socket outside the room cannot use the relay.
     const outsider = connect();
     await once(outsider, "connect");
     let leaked = false;
@@ -211,7 +248,6 @@ describe("Signaling", () => {
     socket.emit("join-room", room.id);
     await once(socket, "room-joined");
 
-    // Every one of these used to be able to kill the process.
     socket.emit("ice-candidate", null);
     socket.emit("offer", null);
     socket.emit("answer", null);
@@ -227,5 +263,75 @@ describe("Signaling", () => {
     const res = await fetch(`${BASE}/api/healthz`);
     assert.equal(res.status, 200, "server must still be alive");
     assert.equal((await res.json()).status, "ok");
+  });
+});
+
+describe("Durability (SQLite)", () => {
+  it("writes rooms to a real database file", async () => {
+    await createRoom("Disk");
+    await delay(100);
+    assert.ok(existsSync(sqlitePath), "expected the sqlite file to exist");
+    assert.ok(statSync(sqlitePath).size > 0);
+  });
+
+  it("keeps rooms across a full server restart", async () => {
+    const room = await createRoom("Survivor");
+
+    sockets.forEach((socket) => socket.disconnect());
+    await stopServer(child);
+
+    child = await startServer();
+
+    const res = await fetch(`${BASE}/api/rooms/${room.id}`);
+    assert.equal(res.status, 200, "room must still exist after a restart");
+    const body = await res.json();
+    assert.equal(body.id, room.id);
+    assert.equal(body.hostName, "Survivor");
+    // Presence is ephemeral by design: nobody is in the call after a restart.
+    assert.equal(body.participantCount, 0);
+  });
+
+  it("sweeps empty rooms past the TTL but keeps occupied ones", async () => {
+    const idle = await createRoom("Idle");
+    const busy = await createRoom("Busy");
+
+    // Rewind the idle room so it looks hours old.
+    const Database = (await import("better-sqlite3")).default;
+    const db = new Database(sqlitePath);
+    db.prepare("UPDATE rooms SET last_seen_at = ? WHERE id = ?").run(
+      Date.now() - 7 * 60 * 60 * 1000,
+      idle.id,
+    );
+    db.close();
+
+    // Keep somebody inside the other room.
+    const socket = connect();
+    await once(socket, "connect");
+    socket.emit("join-room", busy.id);
+    await once(socket, "room-joined");
+
+    // Restart with a 1s TTL and a 300ms sweep interval so the sweeper runs
+    // immediately rather than on its 5-minute default.
+    sockets.forEach((s) => s.disconnect());
+    await stopServer(child);
+    child = await startServer({ ROOM_TTL_MS: "1000", ROOM_SWEEP_INTERVAL_MS: "300" });
+
+    const holder = connect();
+    await once(holder, "connect");
+    holder.emit("join-room", busy.id);
+    await once(holder, "room-joined");
+
+    await delay(1200);
+
+    assert.equal(
+      (await fetch(`${BASE}/api/rooms/${idle.id}`)).status,
+      404,
+      "idle empty room should be swept",
+    );
+    assert.equal(
+      (await fetch(`${BASE}/api/rooms/${busy.id}`)).status,
+      200,
+      "occupied room must never be swept",
+    );
   });
 });

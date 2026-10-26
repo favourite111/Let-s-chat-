@@ -4,48 +4,63 @@ import { createRoom, deleteRoom, getRoom, toPublicRoom } from "../lib/rooms";
 
 const router = Router();
 
-router.post("/rooms", (req, res) => {
-  // Validate with the schema generated from the OpenAPI contract.
-  const parsed = CreateRoomBody.safeParse(req.body ?? {});
+/** Wrap an async handler so rejected promises reach the error middleware. */
+const wrap =
+  (fn: (req: any, res: any) => Promise<void>) =>
+  (req: any, res: any, next: any): void => {
+    fn(req, res).catch(next);
+  };
 
-  if (!parsed.success) {
-    res.status(400).json({ error: "Invalid request body" });
-    return;
-  }
+router.post(
+  "/rooms",
+  wrap(async (req, res) => {
+    // Validate with the schema generated from the OpenAPI contract.
+    const parsed = CreateRoomBody.safeParse(req.body ?? {});
 
-  try {
-    const room = createRoom(parsed.data.hostName);
-    res.status(201).json(toPublicRoom(room));
-  } catch (err) {
-    if (err instanceof Error && err.message === "Room capacity reached") {
-      res.status(503).json({ error: "Server at capacity, try again later" });
+    if (!parsed.success) {
+      res.status(400).json({ error: "Invalid request body" });
       return;
     }
-    throw err;
-  }
-});
 
-router.get("/rooms/:roomId", (req, res) => {
-  const room = getRoom(req.params.roomId);
+    try {
+      const room = await createRoom(parsed.data.hostName);
+      res.status(201).json(await toPublicRoom(room));
+    } catch (err) {
+      if (err instanceof Error && err.message === "Room capacity reached") {
+        res.status(503).json({ error: "Server at capacity, try again later" });
+        return;
+      }
+      throw err;
+    }
+  }),
+);
 
-  if (!room) {
-    res.status(404).json({ error: "Room not found" });
-    return;
-  }
+router.get(
+  "/rooms/:roomId",
+  wrap(async (req, res) => {
+    const room = await getRoom(req.params.roomId);
 
-  res.json(toPublicRoom(room));
-});
+    if (!room) {
+      res.status(404).json({ error: "Room not found" });
+      return;
+    }
 
-router.delete("/rooms/:roomId", (req, res) => {
-  const room = getRoom(req.params.roomId);
+    res.json(await toPublicRoom(room));
+  }),
+);
 
-  if (!room) {
-    res.status(404).json({ error: "Room not found" });
-    return;
-  }
+router.delete(
+  "/rooms/:roomId",
+  wrap(async (req, res) => {
+    const removed = await deleteRoom(req.params.roomId);
 
-  deleteRoom(req.params.roomId);
-  res.status(204).end();
-});
+    if (!removed) {
+      res.status(404).json({ error: "Room not found" });
+      return;
+    }
+
+    res.status(204).end();
+  }),
+);
 
 export default router;

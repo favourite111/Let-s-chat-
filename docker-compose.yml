@@ -1,0 +1,81 @@
+# Default: one container + a bind-mounted SQLite file. No Postgres, no Redis.
+# That is all a single VPS needs.
+#
+#   docker compose up -d --build
+#
+# Optional upgrades (uncomment / use the profiles):
+#   docker compose --profile postgres up -d      # rooms in Postgres
+#   docker compose --profile redis up -d         # presence in Redis (multi-instance)
+#   docker compose --profile postgres --profile redis up -d   # both
+
+services:
+  app:
+    build: .
+    image: videocall:latest
+    container_name: videocall
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      TRUST_PROXY: 1
+      # SQLite (default, durable on a real disk)
+      STORE: auto
+      SQLITE_PATH: /app/data/videocall.db
+      MAX_ROOMS: 20000
+      ROOM_TTL_MS: 7200000
+      # Lock CORS down to your domain in production:
+      # CORS_ORIGINS: https://call.example.com
+      #
+      # Optional TURN relay — strongly recommended on mobile networks:
+      # TURN_URLS: turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349
+      # TURN_USERNAME: user
+      # TURN_CREDENTIAL: secret
+      #
+      # Point these at the optional services below to switch storage:
+      # DATABASE_URL: postgres://videocall:videocall@postgres:5432/videocall
+      # REDIS_URL: redis://redis:6379
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: videocall-postgres
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: videocall
+      POSTGRES_PASSWORD: videocall
+      POSTGRES_DB: videocall
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U videocall"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: videocall-redis
+    profiles: ["redis"]
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:

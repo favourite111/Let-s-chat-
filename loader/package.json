@@ -1,0 +1,23 @@
+{
+  "name": "videocall-loader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pull-to-deploy loader for the VideoCall project: downloads the repo zip, builds it with pnpm, runs and supervises it, and preserves the SQLite database across updates.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "update": "node index.js --update",
+    "check": "node index.js --check",
+    "rollback": "node index.js --rollback",
+    "dev": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": ["loader", "deploy", "videocall", "webrtc", "vps"],
+  "license": "MIT",
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "chalk": "^4.1.2"
+  }
+}

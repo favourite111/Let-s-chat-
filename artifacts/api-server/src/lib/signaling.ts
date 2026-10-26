@@ -1,31 +1,24 @@
-import type { Server as SocketIOServer } from "socket.io";
-import type { Socket } from "socket.io";
+import type { Server as SocketIOServer, Socket } from "socket.io";
 import { logger } from "./logger";
-import { getRoom, joinRoom, leaveRoom } from "./rooms";
+import { joinRoom, leaveRoom, roomPeers } from "./rooms";
 
 /**
  * Socket.IO signaling relay for 1-on-1 WebRTC.
  *
- * Hard rules enforced here:
+ * Rules enforced here:
  *  - every inbound payload is validated before use (a malformed message must
- *    never be able to throw — the old code crashed the process on
- *    `emit("ice-candidate", null)`);
- *  - a socket may only join a room that actually exists in the room store;
+ *    never be able to throw — `emit("ice-candidate", null)` used to exit the
+ *    process);
+ *  - a socket may only join a room that exists in the durable room store;
  *  - relay targets must be sockets that share a room with the sender, so the
  *    server cannot be used as an open message bus;
- *  - each handler is wrapped so a bug degrades to a logged error, not a crash.
+ *  - each handler is wrapped, so a bug degrades to a logged error, not a crash.
  */
 
-const MAX_PEERS_PER_ROOM = 2;
-const MAX_JOIN_ATTEMPTS_PER_MINUTE = 20;
 const MAX_RELAYS_PER_MINUTE = 600;
+const MAX_JOIN_ATTEMPTS_PER_MINUTE = 20;
 
-type RelayPayload = {
-  to: string;
-  offer?: unknown;
-  answer?: unknown;
-  candidate?: unknown;
-};
+type RelayPayload = { to: string; offer?: unknown; answer?: unknown; candidate?: unknown };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -35,7 +28,6 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 128;
 }
 
-/** Parse `{ to, <field> }` and reject anything that does not have the shape. */
 function parseRelay(payload: unknown, field: "offer" | "answer" | "candidate"): RelayPayload | null {
   if (!isPlainObject(payload)) return null;
   const to = payload["to"];
@@ -47,7 +39,6 @@ function parseRelay(payload: unknown, field: "offer" | "answer" | "candidate"): 
   return { to, [field]: body } as RelayPayload;
 }
 
-/** Cheap sliding-window limiter; per-process and per-socket. */
 function createRateLimiter(limit: number, windowMs: number) {
   let windowStart = Date.now();
   let count = 0;
@@ -62,7 +53,6 @@ function createRateLimiter(limit: number, windowMs: number) {
   };
 }
 
-/** Wrap an async/sync handler so a throw never escapes to the process. */
 function safeHandler<T extends unknown[]>(
   socket: Socket,
   event: string,
@@ -86,23 +76,21 @@ export function setupSignaling(io: SocketIOServer) {
   io.on("connection", (socket) => {
     logger.info({ socketId: socket.id }, "Socket connected");
 
-    /** The room this socket is currently signalling in (at most one). */
     let currentRoomId: string | null = null;
 
     const allowJoin = createRateLimiter(MAX_JOIN_ATTEMPTS_PER_MINUTE, 60_000);
     const allowRelay = createRateLimiter(MAX_RELAYS_PER_MINUTE, 60_000);
 
-    /** Only relay to sockets that are in the same room as the caller. */
-    function peerInSameRoom(targetId: string): boolean {
+    /** Relay only to sockets that are in the same room as the caller. */
+    async function peerInSameRoom(targetId: string): Promise<boolean> {
       if (currentRoomId === null) return false;
-      const room = getRoom(currentRoomId);
-      if (!room) return false;
-      return room.participants.has(targetId);
+      const peers = await roomPeers(currentRoomId);
+      return peers.includes(targetId);
     }
 
     socket.on(
       "join-room",
-      safeHandler(socket, "join-room", (roomId: unknown) => {
+      safeHandler(socket, "join-room", async (roomId: unknown) => {
         if (!allowJoin()) {
           socket.emit("join-error", { reason: "rate-limited" });
           return;
@@ -112,19 +100,17 @@ export function setupSignaling(io: SocketIOServer) {
           return;
         }
 
-        // Leave a previously joined room before joining another.
         if (currentRoomId !== null && currentRoomId !== roomId) {
-          leaveRoom(currentRoomId, socket.id);
+          await leaveRoom(currentRoomId, socket.id);
           socket.leave(currentRoomId);
           socket.to(currentRoomId).emit("user-disconnected", socket.id);
           currentRoomId = null;
         }
 
-        const result = joinRoom(roomId, socket.id, MAX_PEERS_PER_ROOM);
+        const result = await joinRoom(roomId, socket.id);
 
         if (!result.ok) {
           if (result.reason === "not-found") {
-            // Rooms must exist in the store: no more "ghost rooms".
             socket.emit("join-error", { reason: "room-not-found" });
             logger.info({ socketId: socket.id, roomId }, "Join rejected: unknown room");
           } else {
@@ -137,17 +123,12 @@ export function setupSignaling(io: SocketIOServer) {
         currentRoomId = roomId;
         socket.join(roomId);
 
-        // Tell the newcomer who is already here — the existing peer creates the
-        // offer, which keeps negotiation deterministic for exactly 2 peers.
-        const others = [...result.room.participants].filter((id) => id !== socket.id);
+        const others = (await roomPeers(roomId)).filter((id) => id !== socket.id);
         socket.emit("room-joined", { roomId, peers: others });
-
-        for (const peer of others) {
-          io.to(peer).emit("user-connected", socket.id);
-        }
+        for (const peer of others) io.to(peer).emit("user-connected", socket.id);
 
         logger.info(
-          { socketId: socket.id, roomId, participants: result.room.participants.size },
+          { socketId: socket.id, roomId, participants: others.length + 1 },
           "User joined room",
         );
       }),
@@ -155,30 +136,30 @@ export function setupSignaling(io: SocketIOServer) {
 
     socket.on(
       "offer",
-      safeHandler(socket, "offer", (payload: unknown) => {
+      safeHandler(socket, "offer", async (payload: unknown) => {
         if (!allowRelay()) return;
         const parsed = parseRelay(payload, "offer");
-        if (!parsed || !peerInSameRoom(parsed.to)) return;
+        if (!parsed || !(await peerInSameRoom(parsed.to))) return;
         socket.to(parsed.to).emit("offer", { offer: parsed.offer, from: socket.id });
       }),
     );
 
     socket.on(
       "answer",
-      safeHandler(socket, "answer", (payload: unknown) => {
+      safeHandler(socket, "answer", async (payload: unknown) => {
         if (!allowRelay()) return;
         const parsed = parseRelay(payload, "answer");
-        if (!parsed || !peerInSameRoom(parsed.to)) return;
+        if (!parsed || !(await peerInSameRoom(parsed.to))) return;
         socket.to(parsed.to).emit("answer", { answer: parsed.answer, from: socket.id });
       }),
     );
 
     socket.on(
       "ice-candidate",
-      safeHandler(socket, "ice-candidate", (payload: unknown) => {
+      safeHandler(socket, "ice-candidate", async (payload: unknown) => {
         if (!allowRelay()) return;
         const parsed = parseRelay(payload, "candidate");
-        if (!parsed || !peerInSameRoom(parsed.to)) return;
+        if (!parsed || !(await peerInSameRoom(parsed.to))) return;
         socket.to(parsed.to).emit("ice-candidate", { candidate: parsed.candidate, from: socket.id });
       }),
     );
@@ -187,13 +168,12 @@ export function setupSignaling(io: SocketIOServer) {
     socket.on(
       "media-state",
       safeHandler(socket, "media-state", (payload: unknown) => {
-        if (!isPlainObject(payload)) return;
-        if (currentRoomId === null) return;
-        const state = {
+        if (!isPlainObject(payload) || currentRoomId === null) return;
+        socket.to(currentRoomId).emit("media-state", {
           audio: payload["audio"] === true,
           video: payload["video"] === true,
-        };
-        socket.to(currentRoomId).emit("media-state", { ...state, from: socket.id });
+          from: socket.id,
+        });
       }),
     );
 
@@ -206,12 +186,13 @@ export function setupSignaling(io: SocketIOServer) {
 
     socket.on(
       "disconnecting",
-      safeHandler(socket, "disconnecting", () => {
+      safeHandler(socket, "disconnecting", async () => {
         if (currentRoomId === null) return;
-        leaveRoom(currentRoomId, socket.id);
-        socket.to(currentRoomId).emit("user-disconnected", socket.id);
-        logger.info({ socketId: socket.id, roomId: currentRoomId }, "User left room");
+        const roomId = currentRoomId;
         currentRoomId = null;
+        await leaveRoom(roomId, socket.id);
+        socket.to(roomId).emit("user-disconnected", socket.id);
+        logger.info({ socketId: socket.id, roomId }, "User left room");
       }),
     );
 
@@ -220,5 +201,3 @@ export function setupSignaling(io: SocketIOServer) {
     });
   });
 }
-
-export type { Socket };

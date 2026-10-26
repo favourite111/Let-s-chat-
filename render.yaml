@@ -24,6 +24,13 @@ services:
       # https://videocall.onrender.com
       - key: CORS_ORIGINS
         sync: false
+      # Render web services have an ephemeral filesystem, so SQLite would be
+      # wiped on every deploy. Attach a Render Postgres and set DATABASE_URL
+      # (or add a persistent disk and keep SQLITE_PATH inside it).
+      - key: DATABASE_URL
+        fromDatabase:
+          name: videocall-db
+          property: connectionString
       # Bring your own TURN relay (coturn/metered) for mobile networks.
       - key: TURN_URLS
         sync: false
@@ -31,3 +38,8 @@ services:
         sync: false
       - key: TURN_CREDENTIAL
         sync: false
+
+databases:
+  - name: videocall-db
+    databaseName: videocall
+    plan: free

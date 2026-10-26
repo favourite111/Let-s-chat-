@@ -2,7 +2,7 @@
 
 Free, no-signup **1-on-1 video calls in the browser**. Create a room, share the link, talk face-to-face. No accounts, no downloads, no plugins.
 
-> **Status:** working prototype, hardened for single-instance deployment. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the known limitations (group calls, horizontal scaling, verified E2EE) before relying on it for anything sensitive.
+> **Status:** working prototype, hardened for single-instance deployment. Rooms are stored in SQLite, so on a VPS they survive restarts and deploys with no extra services. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for limitations (group calls, horizontal scaling, verified E2EE) and [`docs/DEPLOY-VPS.md`](docs/DEPLOY-VPS.md) for a full VPS walkthrough.
 
 ---
 
@@ -42,7 +42,53 @@ pnpm build   # typechecks everything, builds API bundle + SPA
 NODE_ENV=production PORT=8080 node artifacts/api-server/dist/index.mjs
 ```
 
-One process serves the SPA and the API. `render.yaml` is a working blueprint; any Node host works.
+One process serves the SPA and the API. Rooms are written to **`./data/videocall.db`** (SQLite, WAL mode), so they persist across restarts.
+
+### Deploying to a VPS
+
+```bash
+docker compose up -d --build      # app + ./data volume, nothing else needed
+```
+
+Or use the zero-touch loader in [`loader/`](loader/): it pulls the source zip from
+GitHub, builds it, runs and supervises it, and keeps your database — so shipping
+an update is just **restart**.
+
+```bash
+node index.js --check     # what would change?
+node index.js             # update if needed, then run
+```
+
+Step-by-step for Docker, bare Node + systemd, and the loader — plus nginx + HTTPS
++ coturn: **[`docs/DEPLOY-VPS.md`](docs/DEPLOY-VPS.md)**.
+
+## Storage
+
+Three backends, one interface; the app picks one at boot.
+
+| Backend | When it is used | Durable? | Needed for |
+|---|---|---|---|
+| **SQLite** (default) | always, unless told otherwise | ✅ file on disk | a single VPS — recommended |
+| **Postgres** | when `DATABASE_URL` is set (or `STORE=postgres`) | ✅ | hosts with no persistent disk (Render, Railway, Fly), or >1 instance |
+| **memory** | `STORE=memory`, or if SQLite is unavailable at the default path | ❌ | tests |
+
+**Presence** (who is currently in a room) is separate from rooms and lives in memory by default, or in **Redis** when `REDIS_URL` is set — that plus the Socket.IO Redis adapter is what lets you run several instances. A single VPS never needs it.
+
+```bash
+# SQLite (default)
+SQLITE_PATH=./data/videocall.db
+
+# Optional upgrade
+DATABASE_URL=postgres://user:pass@host:5432/videocall    # rooms
+REDIS_URL=redis://host:6379                              # presence + adapter
+```
+
+Both tables are created automatically on boot — there is no migration step.
+
+```bash
+# Back up everything that matters
+sqlite3 data/videocall.db ".backup 'backup.db'"
+```
 
 ## Configuration
 
@@ -57,7 +103,12 @@ All variables are optional locally — see [`.env.example`](.env.example) for th
 | `TRUST_PROXY` | `1` | Set `0` when exposed directly |
 | `RATE_LIMIT_PER_MINUTE` | `600` | General per-IP limit |
 | `ROOM_CREATE_LIMIT_PER_MINUTE` | `30` | `POST /api/rooms` per IP |
-| `MAX_ROOMS` | `10000` | In-memory room cap |
+| `STORE` | `auto` | `auto` \| `sqlite` \| `postgres` \| `memory` |
+| `SQLITE_PATH` | `./data/videocall.db` | Room database file (default store) |
+| `DATABASE_URL` | — | Use Postgres for rooms instead |
+| `REDIS_URL` | — | Redis presence + Socket.IO adapter (multi-instance) |
+| `MAX_ROOMS` | `20000` | Room cap before new rooms are refused |
+| `ROOM_TTL_MS` | `7200000` | Idle-empty-room lifetime (2 h) |
 | `TURN_URLS` / `TURN_USERNAME` / `TURN_CREDENTIAL` | — | Your TURN relay. **Strongly recommended** — without it, calls fail on many mobile/carrier-grade-NAT networks. |
 
 ## API
@@ -89,8 +140,9 @@ lib/
   api-spec/       OpenAPI 3.1 contract + Orval config
   api-client-react/  Generated typed hooks (custom fetch mutator)
   api-zod/        Generated Zod schemas for request/response validation
-  db/             Drizzle/Postgres scaffolding (currently unused)
-docs/             Architecture + limitations
+  db/             Drizzle scaffolding (unused — stores live in artifacts/api-server/src/lib/store)
+docs/             Architecture, limitations, VPS deployment guide
+loader/           Pull-to-deploy loader for a VPS (see docs/DEPLOY-VPS.md)
 scripts/          Workspace utilities
 ```
 

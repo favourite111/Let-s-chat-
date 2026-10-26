@@ -29,6 +29,12 @@ async function buildAll() {
     // - use path traversal to read files (e.g. @google-cloud/secret-manager loads sibling .proto files)
     external: [
       "*.node",
+      // Drivers are optional at runtime: externalising them keeps the bundle
+      // small and lets the server boot even if one is missing.
+      "better-sqlite3",
+      "pg",
+      "redis",
+      "@socket.io/redis-adapter",
       "sharp",
       "better-sqlite3",
       "sqlite3",
