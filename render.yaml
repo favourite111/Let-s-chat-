@@ -2,10 +2,32 @@ services:
   - type: web
     name: videocall
     runtime: node
-    buildCommand: pnpm install --frozen-lockfile && BASE_PATH=/ pnpm --filter @workspace/video-call run build && pnpm --filter @workspace/api-server run build
+    # The build used to omit PORT, which made `vite build` throw before it ever
+    # produced a bundle. Values below are the minimum needed for the build.
+    buildCommand: >-
+      pnpm install --frozen-lockfile &&
+      PORT=5173 BASE_PATH=/ pnpm --filter @workspace/video-call run build &&
+      pnpm --filter @workspace/api-server run build
     startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
+    healthCheckPath: /api/healthz
+    # Rooms live in memory, so a single instance is required until the store is
+    # moved to Postgres/Redis (see docs/ARCHITECTURE.md).
+    numInstances: 1
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 8080
+      - key: TRUST_PROXY
+        value: 1
+      # Set this to your public URL(s) to lock CORS down, e.g.
+      # https://videocall.onrender.com
+      - key: CORS_ORIGINS
+        sync: false
+      # Bring your own TURN relay (coturn/metered) for mobile networks.
+      - key: TURN_URLS
+        sync: false
+      - key: TURN_USERNAME
+        sync: false
+      - key: TURN_CREDENTIAL
+        sync: false

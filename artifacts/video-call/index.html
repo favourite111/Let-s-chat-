@@ -1,13 +1,21 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
-    <title>VideoCall</title>
+    <!-- maximum-scale=1 blocked pinch-zoom (WCAG 1.4.4); keep zoom enabled. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a0a0f" />
+    <meta name="description" content="Free, no-signup 1-on-1 video calls in the browser. Create a room and share the link." />
+    <title>VideoCall — instant face-to-face</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="VideoCall — instant face-to-face" />
+    <meta property="og:description" content="No accounts, no downloads. Create a room and share the link." />
+    <meta property="og:image" content="/opengraph.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   </head>
   <body>
     <div id="root"></div>

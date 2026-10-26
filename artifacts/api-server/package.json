@@ -4,23 +4,28 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "export NODE_ENV=development && pnpm run build && pnpm run start",
+    "dev": "NODE_ENV=development PORT=${PORT:-8080} node ./build.mjs && NODE_ENV=development PORT=${PORT:-8080} node --enable-source-maps ./dist/index.mjs",
     "build": "node ./build.mjs",
     "start": "node --enable-source-maps ./dist/index.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/"
   },
   "dependencies": {
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
+    "compression": "^1.8.2",
     "cookie-parser": "^1.4.7",
     "cors": "^2",
     "drizzle-orm": "catalog:",
     "express": "^5",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0",
     "pino": "^9",
     "pino-http": "^10",
     "socket.io": "^4.8.3"
   },
   "devDependencies": {
+    "@types/compression": "^1.8.1",
     "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
@@ -28,6 +33,7 @@
     "esbuild": "^0.27.3",
     "esbuild-plugin-pino": "^2.3.3",
     "pino-pretty": "^13",
+    "socket.io-client": "^4.8.3",
     "thread-stream": "3.1.0"
   }
 }

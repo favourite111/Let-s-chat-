@@ -28,10 +28,20 @@ export default function Home() {
     );
   };
 
+  /** Accept a bare code, a full URL, or a URL with junk around it. */
+  const extractRoomCode = (input: string): string => {
+    const trimmed = input.trim();
+    const match = trimmed.match(/\/room\/([a-zA-Z0-9]+)/);
+    if (match?.[1]) return match[1].toLowerCase();
+    const lastSegment = trimmed.split(/[/?#\s]/).filter(Boolean).pop() ?? "";
+    return lastSegment.toLowerCase();
+  };
+
   const handleJoinRoom = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!roomCode.trim()) return;
-    setLocation(`/room/${roomCode.trim()}`);
+    const code = extractRoomCode(roomCode);
+    if (!code) return;
+    setLocation(`/room/${code}`);
   };
 
   return (

@@ -1,52 +1,51 @@
 import { Router } from "express";
-import { randomUUID } from "crypto";
+import { CreateRoomBody } from "@workspace/api-zod";
+import { createRoom, deleteRoom, getRoom, toPublicRoom } from "../lib/rooms";
 
 const router = Router();
 
-interface Room {
-  id: string;
-  hostName: string | null;
-  participantCount: number;
-  createdAt: Date;
-}
-
-const roomStore = new Map<string, Room>();
-
 router.post("/rooms", (req, res) => {
-  const { hostName } = req.body ?? {};
-  const id = randomUUID().slice(0, 8);
+  // Validate with the schema generated from the OpenAPI contract.
+  const parsed = CreateRoomBody.safeParse(req.body ?? {});
 
-  const room: Room = {
-    id,
-    hostName: hostName ?? null,
-    participantCount: 0,
-    createdAt: new Date(),
-  };
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid request body" });
+    return;
+  }
 
-  roomStore.set(id, room);
-
-  res.status(201).json({
-    id: room.id,
-    hostName: room.hostName,
-    participantCount: room.participantCount,
-    createdAt: room.createdAt.toISOString(),
-  });
+  try {
+    const room = createRoom(parsed.data.hostName);
+    res.status(201).json(toPublicRoom(room));
+  } catch (err) {
+    if (err instanceof Error && err.message === "Room capacity reached") {
+      res.status(503).json({ error: "Server at capacity, try again later" });
+      return;
+    }
+    throw err;
+  }
 });
 
 router.get("/rooms/:roomId", (req, res) => {
-  const room = roomStore.get(req.params.roomId);
+  const room = getRoom(req.params.roomId);
 
   if (!room) {
     res.status(404).json({ error: "Room not found" });
     return;
   }
 
-  res.json({
-    id: room.id,
-    hostName: room.hostName,
-    participantCount: room.participantCount,
-    createdAt: room.createdAt.toISOString(),
-  });
+  res.json(toPublicRoom(room));
+});
+
+router.delete("/rooms/:roomId", (req, res) => {
+  const room = getRoom(req.params.roomId);
+
+  if (!room) {
+    res.status(404).json({ error: "Room not found" });
+    return;
+  }
+
+  deleteRoom(req.params.roomId);
+  res.status(204).end();
 });
 
 export default router;
