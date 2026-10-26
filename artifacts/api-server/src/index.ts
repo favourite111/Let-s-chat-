@@ -38,12 +38,14 @@ const io = new SocketIOServer(httpServer, {
 
 setupSignaling(io);
 
-httpServer.listen(port, (err?: Error) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
-  }
+httpServer.on("error", (err) => {
+  // EADDRINUSE and friends must fail loudly with a non-zero exit code so the
+  // platform restarts us instead of leaving a silent, broken process.
+  logger.fatal({ err }, "HTTP server error");
+  process.exit(1);
+});
 
+httpServer.listen(port, () => {
   logger.info({ port, env: process.env.NODE_ENV ?? "development" }, "Server listening");
 });
 
