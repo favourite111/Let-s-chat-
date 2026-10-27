@@ -401,15 +401,22 @@ export default function Room() {
             if (freeObservations < 3) return;
 
             // Three consecutive checks with nobody in the host seat: take it.
+            // A short random delay keeps two windows of the same browser from
+            // claiming on the same tick; the loser would be sent back to a
+            // guest seat for no reason.
             stopReclaimWatch();
-            participantId = storedHostId;
-            hostSecret = storedSecret;
-            socket.emit("leave");
             window.setTimeout(() => {
-              if (!cancelled && !terminal && socket.connected) {
-                socket.emit("join-room", joinPayload());
-              }
-            }, 100);
+              if (cancelled || terminal || claimingHost) return;
+              if (!socket.connected) return;
+              participantId = storedHostId;
+              hostSecret = storedSecret;
+              socket.emit("leave");
+              window.setTimeout(() => {
+                if (!cancelled && !terminal && socket.connected) {
+                  socket.emit("join-room", joinPayload());
+                }
+              }, 100);
+            }, 200 + Math.random() * 1800);
           })
           .catch(() => {
             /* transient network error: try again next tick */
@@ -567,16 +574,33 @@ export default function Room() {
       });
 
       /**
-       * This identity was reclaimed by another socket — e.g. the same room
-       * opened in a second tab of a duplicated session. Only one of them can
-       * own the seat; this one stands down rather than pretending to be in a
-       * call it is no longer part of.
+       * Another window of this browser took the seat this one was holding —
+       * a duplicated tab, or two windows racing to reclaim the host seat.
+       *
+       * Only one socket can own a seat, so this one stands down — but it does
+       * not throw the person out of the call: it asks for an ordinary guest
+       * seat instead. If a seat is gone (the winner is a guest and the other
+       * slot is taken) the normal room-full retry takes over.
        */
       socket.on("session-replaced", () => {
-        terminal = true;
-        setStatus("replaced");
-        stopEverything();
-        window.setTimeout(() => socket.disconnect(), 0);
+        if (terminal) return;
+        claimingHost = false;
+        setIsHost(false);
+        participantId = getParticipantId();
+        hostSecret = null;
+        // The peer was talking to the identity that just lost the seat.
+        remoteParticipantIdRef.current = null;
+        qualityRef.current?.stop();
+        qualityRef.current = null;
+        pcRef.current?.close();
+        pcRef.current = null;
+        setHasRemoteVideo(false);
+        setStatus("connecting");
+        window.setTimeout(() => {
+          if (!cancelled && !terminal && socket.connected) {
+            socket.emit("join-room", joinPayload());
+          }
+        }, 250);
       });
 
       socket.on("removed", () => {
