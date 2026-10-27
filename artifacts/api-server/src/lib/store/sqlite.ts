@@ -22,6 +22,8 @@ export class SqliteRoomStore implements RoomStore {
     remove?: any;
     count?: any;
     stale?: any;
+    closeRoom?: any;
+    addRemoved?: any;
   } = {};
 
   constructor(private readonly file: string) {}
@@ -48,13 +50,26 @@ export class SqliteRoomStore implements RoomStore {
       CREATE INDEX IF NOT EXISTS rooms_last_seen_idx ON rooms (last_seen_at);
     `);
 
+    // Ownership and closure columns arrived after the first release. Databases
+    // created by that release still exist (including the one on Render), so add
+    // whatever is missing rather than assuming a fresh table.
+    this.addColumnIfMissing(db, "rooms", "host_participant_id", "TEXT");
+    this.addColumnIfMissing(db, "rooms", "host_secret_hash", "TEXT");
+    this.addColumnIfMissing(db, "rooms", "closed_at", "INTEGER");
+    this.addColumnIfMissing(db, "rooms", "removed_participant_ids", "TEXT NOT NULL DEFAULT '[]'");
+
     this.db = db;
     this.statements = {
       insert: db.prepare(
-        "INSERT INTO rooms (id, host_name, created_at, last_seen_at) VALUES (?, ?, ?, ?)",
+        `INSERT INTO rooms
+           (id, host_name, created_at, last_seen_at,
+            host_participant_id, host_secret_hash, closed_at, removed_participant_ids)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       get: db.prepare(
-        "SELECT id, host_name, created_at, last_seen_at FROM rooms WHERE id = ?",
+        `SELECT id, host_name, created_at, last_seen_at,
+                host_participant_id, host_secret_hash, closed_at, removed_participant_ids
+         FROM rooms WHERE id = ?`,
       ),
       touch: db.prepare("UPDATE rooms SET last_seen_at = ? WHERE id = ?"),
       remove: db.prepare("DELETE FROM rooms WHERE id = ?"),
@@ -62,7 +77,16 @@ export class SqliteRoomStore implements RoomStore {
       stale: db.prepare(
         "SELECT id FROM rooms WHERE last_seen_at < ? ORDER BY last_seen_at ASC LIMIT ?",
       ),
+      closeRoom: db.prepare("UPDATE rooms SET closed_at = ? WHERE id = ? AND closed_at IS NULL"),
+      addRemoved: db.prepare("UPDATE rooms SET removed_participant_ids = ? WHERE id = ?"),
     };
+  }
+
+  /** ALTER TABLE ... ADD COLUMN is not idempotent in SQLite; check first. */
+  private addColumnIfMissing(db: any, table: string, column: string, definition: string): void {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (columns.some((c) => c.name === column)) return;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   async insert(room: RoomRecord): Promise<void> {
@@ -71,12 +95,25 @@ export class SqliteRoomStore implements RoomStore {
       room.hostName,
       room.createdAt.getTime(),
       room.lastSeenAt,
+      room.hostParticipantId,
+      room.hostSecretHash,
+      room.closedAt,
+      JSON.stringify(room.removedParticipantIds ?? []),
     );
   }
 
   async get(id: string): Promise<RoomRecord | undefined> {
     const row = this.statements.get!.get(id) as
-      | { id: string; host_name: string | null; created_at: number; last_seen_at: number }
+      | {
+          id: string;
+          host_name: string | null;
+          created_at: number;
+          last_seen_at: number;
+          host_participant_id: string | null;
+          host_secret_hash: string | null;
+          closed_at: number | null;
+          removed_participant_ids: string | null;
+        }
       | undefined;
     if (!row) return undefined;
 
@@ -85,6 +122,10 @@ export class SqliteRoomStore implements RoomStore {
       hostName: row.host_name,
       createdAt: new Date(row.created_at),
       lastSeenAt: row.last_seen_at,
+      hostParticipantId: row.host_participant_id ?? null,
+      hostSecretHash: row.host_secret_hash ?? null,
+      closedAt: row.closed_at ?? null,
+      removedParticipantIds: parseRemoved(row.removed_participant_ids),
     };
   }
 
@@ -104,8 +145,31 @@ export class SqliteRoomStore implements RoomStore {
     return (this.statements.stale!.all(cutoff, limit) as { id: string }[]).map((r) => r.id);
   }
 
+  async setClosed(id: string, at: number): Promise<boolean> {
+    return this.statements.closeRoom!.run(at, id).changes > 0;
+  }
+
+  async addRemoved(id: string, participantId: string): Promise<boolean> {
+    const room = await this.get(id);
+    if (!room) return false;
+    if (room.removedParticipantIds.includes(participantId)) return true;
+    const next = [...room.removedParticipantIds, participantId];
+    this.statements.addRemoved!.run(JSON.stringify(next), id);
+    return true;
+  }
+
   async close(): Promise<void> {
     this.db?.close();
     this.db = null;
+  }
+}
+
+function parseRemoved(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((v) => typeof v === "string") : [];
+  } catch {
+    return [];
   }
 }

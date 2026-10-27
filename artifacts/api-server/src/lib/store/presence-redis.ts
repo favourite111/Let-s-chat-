@@ -1,4 +1,4 @@
-import type { PresenceStore } from "./types";
+import type { ParticipantRecord, PresenceStore } from "./types";
 
 /**
  * Redis-backed presence, for running more than one instance.
@@ -11,10 +11,16 @@ import type { PresenceStore } from "./types";
  * Multi-instance also requires the Socket.IO Redis adapter (wired in
  * src/index.ts) plus sticky sessions at the load balancer.
  */
-const KEY_PREFIX = "videocall:peers:";
+const KEY_PREFIX = "videocall:participants:";
 const KEY_TTL_SECONDS = 6 * 60 * 60;
 const CONNECT_TIMEOUT_MS = Number(process.env.REDIS_CONNECT_TIMEOUT_MS ?? 8_000);
 
+/**
+ * Participants live in a Redis hash per room, field = participantId, value =
+ * the record as JSON. A hash rather than a set because a participant now
+ * carries a socket, a role and timestamps — and because the record has to
+ * survive a disconnect so a reconnect can reclaim the same seat.
+ */
 export class RedisPresence implements PresenceStore {
   readonly kind = "redis" as const;
   private client: any = null;
@@ -82,27 +88,64 @@ export class RedisPresence implements PresenceStore {
     return `${KEY_PREFIX}${roomId}`;
   }
 
-  async add(roomId: string, socketId: string): Promise<number> {
+  private parse(raw: unknown): ParticipantRecord | null {
+    if (typeof raw !== "string") return null;
+    try {
+      return JSON.parse(raw) as ParticipantRecord;
+    } catch {
+      return null;
+    }
+  }
+
+  async upsert(roomId: string, participant: ParticipantRecord): Promise<void> {
     const key = this.key(roomId);
-    await this.client.sAdd(key, socketId);
+    await this.client.hSet(key, participant.participantId, JSON.stringify(participant));
     await this.client.expire(key, KEY_TTL_SECONDS);
-    return this.client.sCard(key);
   }
 
-  async remove(roomId: string, socketId: string): Promise<number> {
+  async get(roomId: string, participantId: string): Promise<ParticipantRecord | undefined> {
+    return this.parse(await this.client.hGet(this.key(roomId), participantId)) ?? undefined;
+  }
+
+  async remove(roomId: string, participantId: string): Promise<void> {
     const key = this.key(roomId);
-    await this.client.sRem(key, socketId);
-    const size = await this.client.sCard(key);
-    if (size === 0) await this.client.del(key);
-    return size;
+    await this.client.hDel(key, participantId);
+    if ((await this.client.hLen(key)) === 0) await this.client.del(key);
   }
 
-  async peers(roomId: string): Promise<string[]> {
-    return this.client.sMembers(this.key(roomId));
+  async markDisconnected(
+    roomId: string,
+    participantId: string,
+    at: number,
+    socketId?: string | null,
+  ): Promise<boolean> {
+    const key = this.key(roomId);
+    const record = await this.get(roomId, participantId);
+    if (!record) return false;
+
+    // Compare-and-set: a socket that has since been superseded by a reconnect
+    // must not clear the live session.
+    if (socketId !== undefined && record.socketId !== null && record.socketId !== socketId) {
+      return false;
+    }
+
+    record.socketId = null;
+    record.disconnectedAt = at;
+    await this.client.hSet(key, participantId, JSON.stringify(record));
+    await this.client.expire(key, KEY_TTL_SECONDS);
+    return true;
   }
 
-  async count(roomId: string): Promise<number> {
-    return this.client.sCard(this.key(roomId));
+  async list(roomId: string): Promise<ParticipantRecord[]> {
+    const flat: unknown = await this.client.hGetAll(this.key(roomId));
+    if (!flat || typeof flat !== "object") return [];
+    return Object.values(flat as Record<string, unknown>)
+      .map((v) => this.parse(v))
+      .filter((p): p is ParticipantRecord => p !== null);
+  }
+
+  async countConnected(roomId: string): Promise<number> {
+    return (await this.list(roomId)).filter((p) => Boolean(p.socketId)).length;
   }
 
   async clear(roomId: string): Promise<void> {

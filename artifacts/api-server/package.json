@@ -9,7 +9,7 @@
     "start": "node --enable-source-maps ./dist/index.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm run build && pnpm run build:test && node --test test/",
-    "build:test": "esbuild src/test-entry.ts --bundle --platform=node --format=esm --outfile=dist/test-entry.mjs --external:better-sqlite3 --external:pg --external:redis --log-level=warning"
+    "build:test": "esbuild src/test-entry.ts --bundle --platform=node --format=esm --outfile=dist/test-entry.mjs --external:better-sqlite3 --external:pg --external:redis --external:pino --external:pino-pretty --external:thread-stream --log-level=warning"
   },
   "dependencies": {
     "@socket.io/redis-adapter": "^8.3.0",

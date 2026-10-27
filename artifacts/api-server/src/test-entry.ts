@@ -10,7 +10,31 @@ export { SqliteRoomStore } from "./lib/store/sqlite";
 export { PostgresRoomStore } from "./lib/store/postgres";
 export { MemoryPresence } from "./lib/store/presence-memory";
 export { RedisPresence } from "./lib/store/presence-redis";
-export type { PresenceStore, RoomRecord, RoomStore } from "./lib/store/types";
+export type {
+  ParticipantRecord,
+  PresenceStore,
+  RoomRecord,
+  RoomStore,
+} from "./lib/store/types";
+export {
+  abandonRoom,
+  closeRoomByHost,
+  closeRooms,
+  createRoom,
+  getRoom,
+  initRooms,
+  joinRoom,
+  leaveRoom,
+  normaliseParticipantId,
+  purgeStaleParticipants,
+  removeParticipantByHost,
+  roomParticipants,
+  roomSockets,
+  sweepExpired,
+  toPublicParticipants,
+  toPublicRoom,
+  verifyHost,
+} from "./lib/rooms";
 export {
   cloudflareSettingsFromEnv,
   fetchMeteredIceServers,

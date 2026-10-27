@@ -12,6 +12,10 @@ export interface HealthStatus {
 export interface CreateRoomBody {
   /** Optional display name for the host */
   hostName?: string;
+  /** Stable id of the browser creating the room; becomes the owner id */
+  hostParticipantId?: string;
+  /** Secret proving ownership; only its hash is stored server-side */
+  hostSecret?: string;
 }
 
 export interface Room {
@@ -19,6 +23,8 @@ export interface Room {
   hostName?: string | null;
   participantCount: number;
   createdAt: string;
+  /** True once the host has ended the call; closed rooms refuse all joins */
+  closed?: boolean;
 }
 
 export interface ErrorResponse {

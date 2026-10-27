@@ -41,6 +41,29 @@ function connect() {
   return socket;
 }
 
+/** Wait for an event whose payload satisfies `predicate` (later ones win). */
+function onceWhere(socket, event, predicate, timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.off(event, handler);
+      reject(new Error(`Timed out waiting for a matching "${event}"`));
+    }, timeoutMs);
+    function handler(payload) {
+      let matched = false;
+      try {
+        matched = predicate(payload);
+      } catch {
+        matched = false;
+      }
+      if (!matched) return;
+      clearTimeout(timer);
+      socket.off(event, handler);
+      resolve(payload);
+    }
+    socket.on(event, handler);
+  });
+}
+
 function once(socket, event, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`Timed out waiting for "${event}"`)), timeoutMs);
@@ -90,14 +113,42 @@ async function stopServer(proc) {
   await delay(150);
 }
 
-async function createRoom(hostName) {
+let participantSeq = 0;
+/** A fresh participant id in the shape the client mints. */
+function newParticipantId(label = "peer") {
+  participantSeq += 1;
+  return `p_${label}_${String(participantSeq).padStart(6, "0")}`;
+}
+
+const HOST_SECRET = "test-host-secret-0123456789abcdef";
+
+async function createRoom(hostName, owner = null) {
   const res = await fetch(`${BASE}/api/rooms`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ hostName }),
+    body: JSON.stringify({
+      hostName,
+      ...(owner ? { hostParticipantId: owner.participantId, hostSecret: owner.secret } : {}),
+    }),
   });
   assert.equal(res.status, 201);
   return res.json();
+}
+
+/** A room with a real owner, plus the credentials that owner would hold. */
+async function createOwnedRoom(hostName = "Ada") {
+  const owner = { participantId: newParticipantId("host"), secret: HOST_SECRET };
+  const room = await createRoom(hostName, owner);
+  return { room, owner };
+}
+
+/** Join with an identity, and wait for the server's verdict. */
+async function joinRoom(socket, roomId, participantId, extra = {}) {
+  const receipt = once(socket, "room-joined", 4000).catch((err) => ({ error: err }));
+  socket.emit("join-room", { roomId, participantId, ...extra });
+  const result = await receipt;
+  if (result?.error) throw result.error;
+  return result;
 }
 
 before(async () => {
@@ -168,44 +219,116 @@ describe("Signaling", () => {
     const socket = connect();
     await once(socket, "connect");
     const receipt = once(socket, "join-error");
-    socket.emit("join-room", "ghost-room-123");
+    socket.emit("join-room", { roomId: "ghost-room-123", participantId: newParticipantId() });
     assert.equal((await receipt).reason, "room-not-found");
   });
 
+  it("requires a participant identity to join", async () => {
+    const { room } = await createOwnedRoom();
+    const socket = connect();
+    await once(socket, "connect");
+
+    const receipt = once(socket, "join-error");
+    socket.emit("join-room", { roomId: room.id });
+    assert.equal((await receipt).reason, "invalid-participant");
+
+    // The bare-string form is still understood, but anonymous is not.
+    const receipt2 = once(socket, "join-error");
+    socket.emit("join-room", room.id);
+    assert.equal((await receipt2).reason, "invalid-participant");
+  });
+
   it("refuses a third participant", async () => {
-    const room = await createRoom();
+    const { room } = await createOwnedRoom();
     const a = connect();
     const b = connect();
     const c = connect();
     await Promise.all([once(a, "connect"), once(b, "connect"), once(c, "connect")]);
 
-    a.emit("join-room", room.id);
-    await once(a, "room-joined");
-    b.emit("join-room", room.id);
-    await once(b, "room-joined");
+    await joinRoom(a, room.id, newParticipantId("a"));
+    await joinRoom(b, room.id, newParticipantId("b"));
 
     const full = once(c, "room-full");
-    c.emit("join-room", room.id);
+    c.emit("join-room", { roomId: room.id, participantId: newParticipantId("c") });
     await full;
   });
 
+  it("does not count a reload as a second participant", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const host = owner.participantId;
+    const guest = newParticipantId("guest");
+
+    const a = connect();
+    const b = connect();
+    await Promise.all([once(a, "connect"), once(b, "connect")]);
+    await joinRoom(a, room.id, host, { hostSecret: owner.secret });
+    await joinRoom(b, room.id, guest);
+
+    // The guest reloads: a new socket arrives with the same participant id.
+    b.disconnect();
+    await delay(150);
+
+    const b2 = connect();
+    await once(b2, "connect");
+    const reclaimed = once(b2, "room-joined");
+    b2.emit("join-room", { roomId: room.id, participantId: guest });
+    const joined = await reclaimed;
+    assert.equal(joined.reclaimed, true, "the reload must reclaim the same seat");
+
+    const res = await fetch(`${BASE}/api/rooms/${room.id}`);
+    assert.equal((await res.json()).participantCount, 2, "still two people");
+
+    // And a genuinely new person is still refused: the room is full of humans,
+    // not of ghosts of the person who just reloaded.
+    const c = connect();
+    await once(c, "connect");
+    const full = once(c, "room-full");
+    c.emit("join-room", { roomId: room.id, participantId: newParticipantId("c") });
+    await full;
+  });
+
+  it("lets two people join when one of them reloads mid-join", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const host = owner.participantId;
+    const guest = newParticipantId("guest");
+
+    const a = connect();
+    await once(a, "connect");
+    await joinRoom(a, room.id, host, { hostSecret: owner.secret });
+
+    // Guest's first socket dies immediately after (or during) its join.
+    const b = connect();
+    await once(b, "connect");
+    b.emit("join-room", { roomId: room.id, participantId: guest });
+    b.disconnect();
+
+    const b2 = connect();
+    await once(b2, "connect");
+    const joined = await joinRoom(b2, room.id, guest);
+
+    assert.equal(joined.participants.filter((p) => p.connected).length, 2);
+    assert.equal(joined.isHost, false);
+
+    // Both sides see each other.
+    const roster = await onceWhere(b2, "room-state", (state) => state.count === 2);
+    assert.equal(roster.count, 2);
+  });
+
   it("keeps participantCount in sync with the socket layer", async () => {
-    const room = await createRoom();
+    const { room } = await createOwnedRoom();
     const socket = connect();
     await once(socket, "connect");
-    socket.emit("join-room", room.id);
-    await once(socket, "room-joined");
+    await joinRoom(socket, room.id, newParticipantId());
 
     const res = await fetch(`${BASE}/api/rooms/${room.id}`);
     assert.equal((await res.json()).participantCount, 1, "REST must reflect joined sockets");
   });
 
   it("drops the count when the peer leaves", async () => {
-    const room = await createRoom();
+    const { room } = await createOwnedRoom();
     const socket = connect();
     await once(socket, "connect");
-    socket.emit("join-room", room.id);
-    await once(socket, "room-joined");
+    await joinRoom(socket, room.id, newParticipantId());
     socket.disconnect();
     await delay(400);
 
@@ -213,40 +336,82 @@ describe("Signaling", () => {
     assert.equal((await res.json()).participantCount, 0);
   });
 
-  it("relays offer/answer/ICE only inside a room", async () => {
-    const room = await createRoom();
+  it("broadcasts a roster the moment membership changes", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const host = owner.participantId;
+    const guest = newParticipantId("guest");
+
+    const a = connect();
+    await once(a, "connect");
+    await joinRoom(a, room.id, host, { hostSecret: owner.secret, displayName: "Ada" });
+
+    // Wait for the roster that actually contains both people: `room-state` is
+    // also emitted for the host's own join, before this listener existed.
+    const firstState = onceWhere(a, "room-state", (payload) => payload.count === 2);
+    const b = connect();
+    await once(b, "connect");
+    await joinRoom(b, room.id, guest, { displayName: "Grace" });
+    const state = await firstState;
+
+    assert.equal(state.count, 2);
+    const roles = Object.fromEntries(state.participants.map((p) => [p.participantId, p.role]));
+    assert.equal(roles[host], "host");
+    assert.equal(roles[guest], "guest");
+
+    // And it goes back down when the guest drops.
+    const dropped = onceWhere(a, "room-state", (payload) => payload.count === 1);
+    b.disconnect();
+    const after = await dropped;
+    assert.equal(after.count, 1);
+    assert.deepEqual(after.participants.map((p) => p.participantId), [host]);
+  });
+
+  it("relays offer/answer/ICE only inside a room, addressed by participant", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const hostId = owner.participantId;
+    const guestId = newParticipantId("guest");
+
     const a = connect();
     const b = connect();
     await Promise.all([once(a, "connect"), once(b, "connect")]);
-    a.emit("join-room", room.id);
-    await once(a, "room-joined");
+    await joinRoom(a, room.id, hostId, { hostSecret: owner.secret });
+
     const announced = once(a, "user-connected");
-    b.emit("join-room", room.id);
-    const peerId = await announced;
+    await joinRoom(b, room.id, guestId);
+    const announcement = await announced;
+    assert.equal(announcement.participantId, guestId, "peers are announced by identity");
 
     const offerPromise = once(b, "offer");
-    a.emit("offer", { offer: { type: "offer", sdp: "x" }, to: peerId });
+    a.emit("offer", { offer: { type: "offer", sdp: "x" }, to: guestId });
     const offer = await offerPromise;
     assert.equal(offer.offer.sdp, "x");
-    assert.equal(offer.from, a.id);
+    assert.equal(offer.from, hostId);
 
+    const answerPromise = once(a, "answer");
+    b.emit("answer", { answer: { type: "answer", sdp: "y" }, to: hostId });
+    assert.equal((await answerPromise).from, guestId);
+
+    const icePromise = once(b, "ice-candidate");
+    a.emit("ice-candidate", { candidate: { candidate: "c" }, to: guestId });
+    assert.equal((await icePromise).from, hostId);
+
+    // An outsider may not use the server as a relay.
     const outsider = connect();
     await once(outsider, "connect");
     let leaked = false;
     b.once("offer", () => {
       leaked = true;
     });
-    outsider.emit("offer", { offer: { type: "offer", sdp: "spoof" }, to: b.id });
+    outsider.emit("offer", { offer: { type: "offer", sdp: "spoof" }, to: guestId });
     await delay(300);
     assert.equal(leaked, false, "cross-room relay must be dropped");
   });
 
   it("survives malformed payloads instead of crashing", async () => {
-    const room = await createRoom();
+    const { room } = await createOwnedRoom();
     const socket = connect();
     await once(socket, "connect");
-    socket.emit("join-room", room.id);
-    await once(socket, "room-joined");
+    await joinRoom(socket, room.id, newParticipantId());
 
     socket.emit("ice-candidate", null);
     socket.emit("offer", null);
@@ -256,6 +421,9 @@ describe("Signaling", () => {
     socket.emit("join-room", 12345);
     socket.emit("join-room", { $ne: null });
     socket.emit("media-state", null);
+    socket.emit("remove-participant", null);
+    socket.emit("remove-participant", { participantId: "../../etc/passwd" });
+    socket.emit("end-call");
     socket.emit("ping");
 
     await delay(500);
@@ -263,6 +431,233 @@ describe("Signaling", () => {
     const res = await fetch(`${BASE}/api/healthz`);
     assert.equal(res.status, 200, "server must still be alive");
     assert.equal((await res.json()).status, "ok");
+  });
+});
+
+describe("Host controls over the socket", () => {
+  it("ends the call for everyone and closes the room", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const guestId = newParticipantId("guest");
+
+    const host = connect();
+    const guest = connect();
+    await Promise.all([once(host, "connect"), once(guest, "connect")]);
+    await joinRoom(host, room.id, owner.participantId, { hostSecret: owner.secret });
+    await joinRoom(guest, room.id, guestId);
+
+    const hostClosed = once(host, "room-closed");
+    const guestClosed = once(guest, "room-closed");
+    host.emit("end-call");
+
+    assert.equal((await hostClosed).reason, "host-ended-call");
+    assert.equal((await guestClosed).reason, "host-ended-call", "everyone is told, not just the host");
+
+    const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(detail.closed, true);
+    assert.equal(detail.participantCount, 0);
+
+    // Nobody can get back in — including with a fresh socket and identity.
+    const latecomer = connect();
+    await once(latecomer, "connect");
+    const refused = once(latecomer, "room-closed");
+    latecomer.emit("join-room", { roomId: room.id, participantId: newParticipantId("late") });
+    await refused;
+
+    // And the REST close route agrees with the socket.
+    const res = await fetch(`${BASE}/api/rooms/${room.id}`, {
+      method: "DELETE",
+      headers: {
+        "x-participant-id": owner.participantId,
+        "x-host-secret": owner.secret,
+      },
+    });
+    assert.equal(res.status, 409, "already closed");
+  });
+
+  it("refuses end-call from a participant", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const guestId = newParticipantId("guest");
+
+    const host = connect();
+    const guest = connect();
+    await Promise.all([once(host, "connect"), once(guest, "connect")]);
+    await joinRoom(host, room.id, owner.participantId, { hostSecret: owner.secret });
+    await joinRoom(guest, room.id, guestId);
+
+    const refused = once(guest, "host-action-error");
+    guest.emit("end-call");
+    const error = await refused;
+    assert.equal(error.action, "end-call");
+    assert.equal(error.reason, "not-host");
+
+    const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(detail.closed, false, "a guest cannot close the room");
+  });
+
+  it("removes a participant, evicts them and refuses their rejoin", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const guestId = newParticipantId("guest");
+
+    const host = connect();
+    const guest = connect();
+    await Promise.all([once(host, "connect"), once(guest, "connect")]);
+    await joinRoom(host, room.id, owner.participantId, { hostSecret: owner.secret });
+    await joinRoom(guest, room.id, guestId);
+
+    const evicted = once(guest, "removed");
+    const confirmed = once(host, "participant-removed");
+    host.emit("remove-participant", { participantId: guestId });
+
+    assert.equal((await evicted).reason, "removed-by-host");
+    assert.equal((await confirmed).participantId, guestId);
+
+    // The evicted person's socket is gone.
+    await delay(200);
+    assert.equal(guest.connected, false, "the removed socket is disconnected server-side");
+
+    // A brand new socket with the same identity is refused, permanently.
+    const sneaky = connect();
+    await once(sneaky, "connect");
+    const refused = once(sneaky, "removed");
+    sneaky.emit("join-room", { roomId: room.id, participantId: guestId });
+    await refused;
+
+    // The freed slot is usable by someone else.
+    const replacement = connect();
+    await once(replacement, "connect");
+    const joined = await joinRoom(replacement, room.id, newParticipantId("other"));
+    assert.equal(joined.participants.filter((p) => p.connected).length, 2);
+  });
+
+  it("refuses removal from a participant", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const guestId = newParticipantId("guest");
+
+    const host = connect();
+    const guest = connect();
+    await Promise.all([once(host, "connect"), once(guest, "connect")]);
+    await joinRoom(host, room.id, owner.participantId, { hostSecret: owner.secret });
+    await joinRoom(guest, room.id, guestId);
+
+    const refused = once(guest, "host-action-error");
+    guest.emit("remove-participant", { participantId: owner.participantId });
+    const error = await refused;
+    assert.equal(error.action, "remove-participant");
+    assert.equal(error.reason, "not-host");
+
+    // The host is still there.
+    const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(detail.participantCount, 2);
+  });
+
+  it("keeps the host's ownership through a reconnect", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const guestId = newParticipantId("guest");
+
+    const hostSocket = connect();
+    const guest = connect();
+    await Promise.all([once(hostSocket, "connect"), once(guest, "connect")]);
+    const first = await joinRoom(hostSocket, room.id, owner.participantId, {
+      hostSecret: owner.secret,
+    });
+    assert.equal(first.isHost, true);
+    await joinRoom(guest, room.id, guestId);
+
+    // Host's connection drops, then returns on a new socket.
+    hostSocket.disconnect();
+    await delay(300);
+
+    const hostAgain = connect();
+    await once(hostAgain, "connect");
+    const rejoined = await joinRoom(hostAgain, room.id, owner.participantId, {
+      hostSecret: owner.secret,
+    });
+    assert.equal(rejoined.isHost, true, "ownership survives the reconnect");
+    assert.equal(rejoined.reclaimed, true);
+
+    // Still able to close: the powers came back with the identity.
+    const closed = once(guest, "room-closed");
+    hostAgain.emit("end-call");
+    await closed;
+  });
+
+  it("does not let the remaining participant become host when the host is gone", async () => {
+    const { room, owner } = await createOwnedRoom();
+    const guestId = newParticipantId("guest");
+
+    const hostSocket = connect();
+    const guest = connect();
+    await Promise.all([once(hostSocket, "connect"), once(guest, "connect")]);
+    await joinRoom(hostSocket, room.id, owner.participantId, { hostSecret: owner.secret });
+    await joinRoom(guest, room.id, guestId);
+
+    hostSocket.disconnect();
+    await delay(400);
+
+    const refused = once(guest, "host-action-error");
+    guest.emit("end-call");
+    assert.equal((await refused).reason, "not-host");
+
+    // The room is still the original host's, and still open.
+    const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(detail.closed, false);
+    assert.equal(detail.participantCount, 1);
+
+    // If they pretend to be the host by reusing the id, the secret is not there.
+    const impostor = connect();
+    await once(impostor, "connect");
+    const rejected = once(impostor, "join-error");
+    impostor.emit("join-room", { roomId: room.id, participantId: owner.participantId });
+    assert.equal((await rejected).reason, "host-auth-failed");
+  });
+});
+
+describe("REST host authorization", () => {
+  it("refuses an unauthenticated close", async () => {
+    const { room } = await createOwnedRoom();
+
+    const anonymous = await fetch(`${BASE}/api/rooms/${room.id}`, { method: "DELETE" });
+    assert.equal(anonymous.status, 403);
+
+    const withIdOnly = await fetch(`${BASE}/api/rooms/${room.id}`, {
+      method: "DELETE",
+      headers: { "x-participant-id": "p_someone_00001" },
+    });
+    assert.equal(withIdOnly.status, 403);
+
+    const wrongSecret = await fetch(`${BASE}/api/rooms/${room.id}`, {
+      method: "DELETE",
+      headers: {
+        "x-participant-id": room.hostName === "Ada" ? "p_wrong_00000001" : "x",
+        "x-host-secret": "guess",
+      },
+    });
+    assert.equal(wrongSecret.status, 403);
+
+    const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(detail.closed, false, "nothing closed the room");
+  });
+
+  it("closes the room for the host and tells the people inside", async () => {
+    const { room, owner } = await createOwnedRoom();
+
+    const guest = connect();
+    await once(guest, "connect");
+    await joinRoom(guest, room.id, newParticipantId("guest"));
+
+    const notified = once(guest, "room-closed");
+    const res = await fetch(`${BASE}/api/rooms/${room.id}`, {
+      method: "DELETE",
+      headers: {
+        "x-participant-id": owner.participantId,
+        "x-host-secret": owner.secret,
+      },
+    });
+    assert.equal(res.status, 204);
+    assert.equal((await notified).reason, "host-ended-call");
+
+    const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(detail.closed, true);
   });
 });
 
@@ -307,8 +702,7 @@ describe("Durability (SQLite)", () => {
     // Keep somebody inside the other room.
     const socket = connect();
     await once(socket, "connect");
-    socket.emit("join-room", busy.id);
-    await once(socket, "room-joined");
+    await joinRoom(socket, busy.id, newParticipantId("busy"));
 
     // Restart with a 1s TTL and a 300ms sweep interval so the sweeper runs
     // immediately rather than on its 5-minute default.
@@ -318,8 +712,7 @@ describe("Durability (SQLite)", () => {
 
     const holder = connect();
     await once(holder, "connect");
-    holder.emit("join-room", busy.id);
-    await once(holder, "room-joined");
+    await joinRoom(holder, busy.id, newParticipantId("holder"));
 
     await delay(1200);
 

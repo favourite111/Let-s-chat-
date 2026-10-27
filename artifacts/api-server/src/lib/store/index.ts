@@ -6,7 +6,7 @@ import { SqliteRoomStore } from "./sqlite";
 import { PostgresRoomStore } from "./postgres";
 import type { PresenceStore, RoomStore } from "./types";
 
-export type { PresenceStore, RoomRecord, RoomStore } from "./types";
+export type { ParticipantRecord, PresenceStore, RoomRecord, RoomStore } from "./types";
 export { MemoryRoomStore, MemoryPresence, SqliteRoomStore, PostgresRoomStore, RedisPresence };
 
 export const DEFAULT_SQLITE_PATH = "./data/videocall.db";

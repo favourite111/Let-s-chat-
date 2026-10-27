@@ -23,6 +23,18 @@ export const CreateRoomBody = zod.object({
     .string()
     .optional()
     .describe("Optional display name for the host"),
+  hostParticipantId: zod
+    .string()
+    .optional()
+    .describe(
+      "Stable id of the participant creating the room. Stored as the room's owner; ownership is never transferred.",
+    ),
+  hostSecret: zod
+    .string()
+    .optional()
+    .describe(
+      "Secret held only by the creator's browser. Only its SHA-256 hash is stored, and it is required to exercise host privileges.",
+    ),
 });
 
 /**
@@ -37,4 +49,5 @@ export const GetRoomResponse = zod.object({
   hostName: zod.string().nullish(),
   participantCount: zod.number(),
   createdAt: zod.coerce.date(),
+  closed: zod.boolean().optional(),
 });

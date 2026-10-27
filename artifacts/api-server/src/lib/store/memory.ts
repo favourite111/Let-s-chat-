@@ -8,12 +8,15 @@ export class MemoryRoomStore implements RoomStore {
   async init(): Promise<void> {}
 
   async insert(room: RoomRecord): Promise<void> {
-    this.rooms.set(room.id, { ...room });
+    this.rooms.set(room.id, {
+      ...room,
+      removedParticipantIds: [...room.removedParticipantIds],
+    });
   }
 
   async get(id: string): Promise<RoomRecord | undefined> {
     const room = this.rooms.get(id);
-    return room ? { ...room } : undefined;
+    return room ? { ...room, removedParticipantIds: [...room.removedParticipantIds] } : undefined;
   }
 
   async touch(id: string, at: number): Promise<void> {
@@ -36,6 +39,22 @@ export class MemoryRoomStore implements RoomStore {
       if (stale.length >= limit) break;
     }
     return stale;
+  }
+
+  async setClosed(id: string, at: number): Promise<boolean> {
+    const room = this.rooms.get(id);
+    if (!room) return false;
+    room.closedAt = at;
+    return true;
+  }
+
+  async addRemoved(id: string, participantId: string): Promise<boolean> {
+    const room = this.rooms.get(id);
+    if (!room) return false;
+    if (!room.removedParticipantIds.includes(participantId)) {
+      room.removedParticipantIds.push(participantId);
+    }
+    return true;
   }
 
   async close(): Promise<void> {

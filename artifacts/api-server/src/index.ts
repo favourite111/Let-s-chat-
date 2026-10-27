@@ -73,7 +73,11 @@ async function main() {
     },
     maxHttpBufferSize: 1e5, // 100 kB is plenty for SDP + ICE payloads
     connectTimeout: 20_000,
-    pingTimeout: 25_000,
+    // A dead socket is detected in ~30 s instead of ~50 s. The default pair
+    // (25 s + 25 s) is what kept a closed mobile tab holding a seat long
+    // enough for the next join to be refused with "room full".
+    pingInterval: 10_000,
+    pingTimeout: 20_000,
   });
 
   await attachRedisAdapter(io);

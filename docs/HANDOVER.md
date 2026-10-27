@@ -41,8 +41,14 @@ curl -s https://let-s-chat-rvgk.onrender.com/api/ice
 - **Opus tuning:** the negotiated SDP carries
   `maxaveragebitrate=32000;stereo=0;usedtx=1;useinbandfec=1`.
 - **Codec preference:** H.264 is negotiated first (hardware encoding on phones).
-- **API suite:** 46 tests, 45 pass, 1 skipped (the Postgres idempotency case
+- **API suite:** 88 tests, 87 pass, 1 skipped (the Postgres idempotency case
   needs a real `DATABASE_URL`).
+- **Identity and host controls, end to end:** 31 checks in a real browser with
+  a fake camera, against the production build — reload keeps the same seat,
+  a third person is refused *recoverably* and gets in when a seat frees, the
+  host ends the call for everyone, a removed participant cannot rejoin, a
+  participant has no host controls, ownership survives a reload and a 3-second
+  network blip, and video comes back after both. See "Identities and roles".
 
 ## Things that will expire
 
@@ -68,6 +74,56 @@ per-client credentials) — set `CLOUDFLARE_TURN_KEY_ID` and
 **1-on-1 only.** The room model caps at two participants. Group calls are a
 design change, not a config change.
 
+**Host powers are tied to one browser profile.** The host secret lives in that
+browser's `localStorage`, keyed by room id. Clearing site data, using private
+mode, or opening the room on another device means the room still belongs to the
+original creator but nobody can prove it — the room stays open until it
+expires (2 h idle) and cannot be closed early. That is the deliberate
+consequence of never transferring ownership: there is no recovery path, by
+design.
+
+## Identities and roles
+
+Every browser mints a **participant id** (`videocall:participant-id`) and keeps
+it forever. That id — not the socket — is what presence is keyed by, so a
+reload or a reconnection reclaims the same seat instead of arriving as a second
+person. This was the ghost-participant bug: counts keyed by socket, and a stale
+socket holding a seat for up to ~50 s.
+
+**Capacity counts connected participants only.** A dropped participant keeps
+their seat (identity) for `PARTICIPANT_GRACE_MS` (45 s) but not a slot, so a
+dead connection can never make the room look full. "Room full" is a recoverable
+state in the UI: the client retries every 5 s and walks in as soon as a seat
+frees.
+
+**Ownership is fixed at creation and never transferred.** The creator stores a
+secret in `localStorage` (`videocall:host-secret:<roomId>`); the server keeps
+only its SHA-256. Host rights require *both* the owner's participant id and the
+secret, verified server-side on every host action — the client drawing a button
+is not authorization. Room closure is permanent; removed participant ids are
+stored on the room, so a reconnect, reload or waiting out the grace period does
+not let them back in.
+
+Ownership survives the host disconnecting, reloading or reconnecting. There is
+no host transfer, automatic or manual, under any circumstances: if the host
+never returns, the room simply expires.
+
+### Socket protocol (server-enforced)
+
+| Direction | Event | Notes |
+|---|---|---|
+| → server | `join-room {roomId, participantId, hostSecret?, displayName?}` | Re-emitted on every reconnect |
+| ← client | `room-joined {self, participants, reclaimed, isHost}` | |
+| ← client | `room-state {participants, count}` | Roster broadcast on every membership change; connected only |
+| ← client | `join-error {reason}` / `room-full` / `room-closed` / `removed` | `room-full` is the only retryable one |
+| ⇄ relay | `offer` / `answer` / `ice-candidate` with `to: participantId` | `from` is added server-side; cross-room relay is dropped |
+| → server | `end-call`, `remove-participant {participantId}` | Host only; secret re-verified server-side, `host-action-error` otherwise |
+| → server | `leave` | Explicit departure: frees the seat now instead of after the grace period |
+
+REST: `DELETE /api/rooms/:id` now needs `x-participant-id` + `x-host-secret` and
+**closes** the room (it no longer deletes the row, so joins can be refused
+afterwards). It also notifies anyone still connected.
+
 ## Deploying a change
 
 Push to `main`. Render rebuilds and redeploys automatically.
@@ -80,6 +136,22 @@ The Dockerfile is load-bearing in two places, both commented in the file:
   workspace root, prune empties `artifacts/api-server/node_modules` and the
   server then dies at boot with `Cannot find package 'better-sqlite3'`. There
   is a build-time assertion that catches this before it ships.
+
+## Environment variables added in this phase
+
+All optional; the defaults are what the deployment already runs with.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PARTICIPANT_GRACE_MS` | `45000` | How long a disconnected participant keeps their seat |
+| `SQLITE_PATH` | `./data/videocall.db` | Where the SQLite file lives (ignored when `STORE=postgres`) |
+| `PG_POOL_SIZE` | driver default | Postgres pool size |
+| `REDIS_CONNECT_TIMEOUT_MS` | `8000` | Fail fast instead of retrying a bad `REDIS_URL` forever |
+
+No action is needed on Render: the existing service picks these up with the
+defaults. The `rooms` table gains `host_participant_id`, `host_secret_hash`,
+`closed_at` and `removed_participant_ids` at boot via `ADD COLUMN IF NOT
+EXISTS`, so the live database migrates itself in place.
 
 ## Running it somewhere else
 

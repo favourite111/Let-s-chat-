@@ -16,7 +16,11 @@ import {
   Loader2,
   WifiOff,
   RotateCcw,
+  UserX,
+  Crown,
+  PhoneOff as PhoneOffIcon,
 } from "lucide-react";
+import { getHostSecret, getParticipantId } from "@/lib/identity";
 import {
   AdaptiveVideoController,
   PROFILES,
@@ -25,7 +29,25 @@ import {
   type QualityLevel,
 } from "@/lib/rtc-quality";
 
-type ConnectionStatus = "connecting" | "waiting" | "connected" | "reconnecting" | "failed";
+type ConnectionStatus =
+  | "connecting"
+  | "waiting"
+  | "connected"
+  | "reconnecting"
+  | "failed"
+  /** Room is at capacity right now — recoverable, retried automatically. */
+  | "full"
+  /** The host ended the call; the room is closed for good. */
+  | "closed"
+  /** The host removed this participant; they cannot rejoin. */
+  | "removed";
+
+interface RosterEntry {
+  participantId: string;
+  role: "host" | "guest";
+  displayName: string | null;
+  connected: boolean;
+}
 
 const QUALITY_COLOR: Record<QualityLevel, string> = {
   good: "#22c55e",
@@ -65,7 +87,7 @@ export default function Room() {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
-  const remoteUserIdRef = useRef<string | null>(null);
+  const remoteParticipantIdRef = useRef<string | null>(null);
   const iceServersRef = useRef<RTCIceServer[]>(FALLBACK_ICE_SERVERS);
   const iceBufferRef = useRef<RTCIceCandidateInit[]>([]);
   const remoteDescSetRef = useRef(false);
@@ -85,6 +107,11 @@ export default function Room() {
   const [audioOnlyMode, setAudioOnlyMode] = useState(false);
   const [callSeconds, setCallSeconds] = useState(0);
   const [quality, setQuality] = useState<QualityLevel | null>(null);
+  // Roster comes from the server, never inferred from whether video is flowing.
+  const [roster, setRoster] = useState<RosterEntry[]>([]);
+  const [isHost, setIsHost] = useState(false);
+  const [selfParticipantId, setSelfParticipantId] = useState<string | null>(null);
+  const [joinAttempt, setJoinAttempt] = useState(0);
 
   // WhatsApp-style swap: false = remote is main, true = local is main
   const [isSwapped, setIsSwapped] = useState(false);
@@ -142,10 +169,24 @@ export default function Room() {
   }, [status]);
 
   // --- WebRTC + signaling ---
+  //
+  // Identity, not sockets: this browser presents the same participantId on
+  // every join, so a reload or a reconnect reclaims its seat rather than
+  // arriving as a second person and filling the room with ghosts.
   useEffect(() => {
     if (!roomId) return;
 
     let cancelled = false;
+    // Set once the room is closed or we are removed: nothing may move the UI
+    // out of that state again, including the socket's own disconnect handler.
+    let terminal = false;
+    let retryTimer: number | null = null;
+
+    const participantId = getParticipantId();
+    // Only the room's creator has one of these; it is what proves ownership.
+    const hostSecret = getHostSecret(roomId);
+
+    setSelfParticipantId(participantId);
 
     const emitMediaState = () => {
       const socket = socketRef.current;
@@ -191,10 +232,10 @@ export default function Room() {
       };
 
       pc.onicecandidate = (event) => {
-        if (!event.candidate || !remoteUserIdRef.current) return;
+        if (!event.candidate || !remoteParticipantIdRef.current) return;
         socket.emit("ice-candidate", {
           candidate: event.candidate.toJSON(),
-          to: remoteUserIdRef.current,
+          to: remoteParticipantIdRef.current,
         });
       };
 
@@ -247,6 +288,18 @@ export default function Room() {
       controller.start(pc, setQuality);
     };
 
+    /** Release hardware, peer connection and quality loop for good. */
+    const stopEverything = () => {
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+      if (localVideoRef.current) localVideoRef.current.srcObject = null;
+      qualityRef.current?.stop();
+      qualityRef.current = null;
+      pcRef.current?.close();
+      pcRef.current = null;
+      setHasRemoteVideo(false);
+    };
+
     const start = async () => {
       // 1. ICE servers (server-provided, so TURN can change without a rebuild).
       try {
@@ -292,10 +345,13 @@ export default function Room() {
       const socket = io({ path: "/socket.io", transports: ["websocket", "polling"] });
       socketRef.current = socket;
 
+      const joinPayload = { roomId, participantId, hostSecret, displayName: null };
+
       socket.on("connect", () => {
-        setStatus("waiting");
+        if (terminal) return;
+        setStatus("connecting");
         setHasRemoteVideo(false);
-        remoteUserIdRef.current = null;
+        remoteParticipantIdRef.current = null;
         // Fresh peer connection per connection attempt.
         if (pcRef.current) {
           pcRef.current.ontrack = null;
@@ -303,20 +359,48 @@ export default function Room() {
           pcRef.current.close();
           pcRef.current = null;
         }
-        socket.emit("join-room", roomId);
-        emitMediaState();
+        socket.emit("join-room", joinPayload);
       });
 
-      socket.on("disconnect", () => setStatus("reconnecting"));
-
-      socket.on("room-joined", ({ peers }: { peers?: string[] }) => {
-        if (peers && peers.length > 0) {
-          remoteUserIdRef.current = peers[0] ?? null;
-          setStatus("connecting"); // waiting for the first offer
-        } else {
-          setStatus("waiting");
-        }
+      socket.on("disconnect", () => {
+        if (!terminal) setStatus("reconnecting");
       });
+
+      socket.on(
+        "room-joined",
+        ({
+          participants,
+          isHost: hostFlag,
+        }: {
+          participants?: RosterEntry[];
+          isHost?: boolean;
+          reclaimed?: boolean;
+        }) => {
+          setIsHost(Boolean(hostFlag));
+          setRoster(participants ?? []);
+          setJoinAttempt(0);
+
+          const others = (participants ?? []).filter(
+            (p) => p.participantId !== participantId && p.connected,
+          );
+          if (others.length > 0) {
+            // They will send us an offer once `user-connected` reaches them.
+            setStatus("connecting");
+          } else {
+            setStatus("waiting");
+          }
+          emitMediaState();
+        },
+      );
+
+      socket.on(
+        "room-state",
+        ({ participants, count }: { participants?: RosterEntry[]; count?: number }) => {
+          const next = participants ?? [];
+          setRoster(next);
+          if (typeof count === "number" && count < 1) setStatus("waiting");
+        },
+      );
 
       socket.on("join-error", ({ reason }: { reason?: string }) => {
         if (reason === "room-not-found") {
@@ -324,24 +408,71 @@ export default function Room() {
           setLocation("/");
         } else if (reason === "rate-limited") {
           toast.error("Too many attempts. Wait a moment and try again.");
+          setStatus("reconnecting");
+        } else if (reason === "host-auth-failed") {
+          toast.error(
+            "This browser can't prove it owns the room. Open it from the device that created the call.",
+          );
+          setStatus("failed");
         }
       });
 
+      /**
+       * Room at capacity. Recoverable: retried on a timer, without leaving the
+       * page, because the usual cause is the other person's previous socket not
+       * having timed out yet.
+       */
       socket.on("room-full", () => {
-        setStatus("failed");
-        toast.error("This call already has two people in it.");
+        if (terminal) return;
+        setStatus("full");
+        if (retryTimer !== null) return;
+        retryTimer = window.setTimeout(() => {
+          retryTimer = null;
+          if (cancelled) return;
+          setJoinAttempt((n) => n + 1);
+          if (socketRef.current?.connected) {
+            socketRef.current.emit("join-room", joinPayload);
+          }
+        }, 5000);
       });
 
-      // Existing peer gets told a newcomer arrived → it creates the offer.
-      socket.on("user-connected", async (userId: string) => {
-        remoteUserIdRef.current = userId;
+      socket.on("room-closed", () => {
+        terminal = true;
+        setStatus("closed");
+        // Terminal: turn the hardware off, not just the video element.
+        stopEverything();
+        window.setTimeout(() => socket.disconnect(), 0);
+      });
+
+      socket.on("removed", () => {
+        terminal = true;
+        setStatus("removed");
+        stopEverything();
+        window.setTimeout(() => socket.disconnect(), 0);
+      });
+
+      socket.on("host-action-error", ({ action, reason }: { action?: string; reason?: string }) => {
+        if (action === "end-call") toast.error("Only the host can end this call.");
+        else if (action === "remove-participant")
+          toast.error(reason === "target-not-found" ? "That participant already left." : "Only the host can remove someone.");
+      });
+
+      socket.on("participant-removed", () => {
+        toast.success("Participant removed.");
+      });
+
+      // A peer is present — a newcomer, or the same person after a reload. In
+      // both cases this side offers a fresh connection: their old one is dead.
+      socket.on("user-connected", async ({ participantId: peerId }: { participantId: string }) => {
+        if (peerId === participantId) return;
+        remoteParticipantIdRef.current = peerId;
         const pc = createPeer(socket);
         try {
           const offer = await pc.createOffer();
           // Opus tuning has to happen in the SDP text — there is no API for it.
           offer.sdp = tuneOpusSdp(offer.sdp ?? "");
           await pc.setLocalDescription(offer);
-          socket.emit("offer", { offer, to: userId });
+          socket.emit("offer", { offer, to: peerId });
           startQualityLoop(pc);
         } catch (err) {
           console.error("Error creating offer", err);
@@ -351,7 +482,7 @@ export default function Room() {
       socket.on(
         "offer",
         async ({ offer, from }: { offer: RTCSessionDescriptionInit; from: string }) => {
-          remoteUserIdRef.current = from;
+          remoteParticipantIdRef.current = from;
           const pc = pcRef.current ?? createPeer(socket);
           try {
             await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -406,7 +537,7 @@ export default function Room() {
         setHasRemoteVideo(false);
         setRemoteMuted(false);
         setRemoteVideoOff(false);
-        remoteUserIdRef.current = null;
+        remoteParticipantIdRef.current = null;
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
         qualityRef.current?.stop();
         qualityRef.current = null;
@@ -421,6 +552,7 @@ export default function Room() {
 
     return () => {
       cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
       qualityRef.current?.stop();
@@ -471,10 +603,62 @@ export default function Room() {
   };
 
   const leaveCall = () => {
+    // Tell the server first: this releases the seat immediately instead of
+    // leaving a ghost that holds the slot until the ping timeout.
+    socketRef.current?.emit("leave");
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
     pcRef.current?.close();
     socketRef.current?.disconnect();
     setLocation("/");
+  };
+
+  /**
+   * Host-only: end the call for everyone and close the room permanently.
+   * The server re-checks ownership; this call is refused if we are not the host.
+   */
+  const endCallForEveryone = () => {
+    if (!roomId) return;
+    const ok = window.confirm(
+      "End the call for everyone? The room closes and nobody can rejoin.",
+    );
+    if (!ok) return;
+    const socket = socketRef.current;
+
+    if (socket?.connected) {
+      // The server re-verifies ownership, closes the room and broadcasts
+      // `room-closed` to everyone (host included). The listener above does the
+      // teardown, so the UI only changes once the server has actually closed it.
+      socket.emit("end-call");
+      return;
+    }
+
+    // Socket is down: close over REST. The server notifies the room from there.
+    const participantId = getParticipantId();
+    const hostSecret = getHostSecret(roomId);
+    if (!participantId || !hostSecret) {
+      toast.error("This browser can't prove it owns the room.");
+      return;
+    }
+
+    void fetch(`/api/rooms/${roomId}`, {
+      method: "DELETE",
+      headers: { "x-participant-id": participantId, "x-host-secret": hostSecret },
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(String(res.status));
+        setStatus("closed");
+      })
+      .catch(() => toast.error("Couldn't close the room. Check your connection and try again."));
+  };
+
+  /** Host-only: kick one participant out of the room for good. */
+  const removeParticipant = (participantId: string) => {
+    const socket = socketRef.current;
+    if (!socket?.connected) {
+      toast.error("Not connected — try again in a moment.");
+      return;
+    }
+    socket.emit("remove-participant", { participantId });
   };
 
   const formatDuration = (total: number) => {
@@ -518,7 +702,48 @@ export default function Room() {
     );
   }
 
+  /**
+   * Terminal states. These are not retried: the room is closed or this
+   * participant was removed, and the server will refuse a rejoin anyway.
+   */
+  if (status === "closed" || status === "removed") {
+    const closed = status === "closed";
+    return (
+      <div style={{ minHeight: "100dvh", background: "#0a0a0f", display: "flex", alignItems: "center", justifyContent: "center", padding: "24px" }}>
+        <div style={{ background: "rgba(124,92,252,0.08)", border: "1px solid rgba(124,92,252,0.2)", borderRadius: "20px", padding: "32px", textAlign: "center", maxWidth: "420px", width: "100%" }}>
+          <div style={{ width: "64px", height: "64px", borderRadius: "50%", background: closed ? "rgba(239,68,68,0.15)" : "rgba(245,158,11,0.15)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}>
+            {closed ? (
+              <PhoneOffIcon style={{ color: "#ef4444", width: "28px", height: "28px" }} aria-hidden="true" />
+            ) : (
+              <UserX style={{ color: "#fbbf24", width: "28px", height: "28px" }} aria-hidden="true" />
+            )}
+          </div>
+          <h2 style={{ color: "#fff", fontSize: "20px", fontWeight: 700, marginBottom: "8px" }}>
+            {closed ? "Call ended" : "You were removed"}
+          </h2>
+          <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "14px", lineHeight: 1.6 }}>
+            {closed
+              ? "The host ended this call. This room is closed and cannot be rejoined."
+              : "The host removed you from this room, so you can't rejoin it."}
+          </p>
+          <Button
+            onClick={() => setLocation("/")}
+            style={{ width: "100%", marginTop: "20px", background: "linear-gradient(135deg, #7c5cfc, #6c47ff)", border: "none", borderRadius: "12px", color: "#fff", fontWeight: 600, padding: "12px", cursor: "pointer" }}
+          >
+            Back to home
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   const showWaiting = status === "waiting" || status === "connecting";
+  const connectedCount = roster.filter((p) => p.connected).length;
+  const participantCount = Math.max(connectedCount, 1);
+  const remotePeer = roster.find(
+    (p) => p.connected && p.participantId !== selfParticipantId,
+  );
+  const selfEntry = roster.find((p) => p.participantId === selfParticipantId);
   const showRemoteVideoOff = remoteVideoOff;
 
   const pipWrapperStyle: React.CSSProperties = {
@@ -594,12 +819,21 @@ export default function Room() {
             </div>
           )}
           <div
-            aria-label={`${hasRemoteVideo ? 2 : 1} participants`}
+            aria-label={`${participantCount} ${participantCount === 1 ? "participant" : "participants"}`}
             style={{ display: "flex", alignItems: "center", gap: "4px", background: "rgba(255,255,255,0.1)", borderRadius: "20px", padding: "4px 10px", fontSize: "12px", color: "rgba(255,255,255,0.7)" }}
           >
             <Users style={{ width: "12px", height: "12px" }} aria-hidden="true" />
-            {hasRemoteVideo ? "2" : "1"}
+            {participantCount}
           </div>
+          {isHost && (
+            <div
+              aria-label="You are the host"
+              style={{ display: "flex", alignItems: "center", gap: "4px", background: "rgba(124,92,252,0.2)", border: "1px solid rgba(124,92,252,0.4)", borderRadius: "20px", padding: "4px 10px", fontSize: "12px", color: "#c4b5fd", fontWeight: 600 }}
+            >
+              <Crown style={{ width: "12px", height: "12px" }} aria-hidden="true" />
+              Host
+            </div>
+          )}
           <button
             onClick={copyLink}
             aria-label="Copy this call link"
@@ -636,6 +870,34 @@ export default function Room() {
         >
           <WifiOff style={{ width: "14px", height: "14px" }} aria-hidden="true" />
           Reconnecting…
+        </div>
+      )}
+
+      {status === "full" && (
+        <div
+          role="status"
+          style={{
+            position: "absolute",
+            top: "70px",
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 35,
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            background: "rgba(245,158,11,0.15)",
+            border: "1px solid rgba(245,158,11,0.35)",
+            color: "#fbbf24",
+            borderRadius: "999px",
+            padding: "6px 14px",
+            fontSize: "12px",
+            fontWeight: 600,
+            backdropFilter: "blur(8px)",
+            whiteSpace: "nowrap",
+          }}
+        >
+          <Loader2 style={{ width: "14px", height: "14px", animation: "spin 1s linear infinite" }} aria-hidden="true" />
+          Room is full — retrying in a moment
         </div>
       )}
 
@@ -806,10 +1068,36 @@ export default function Room() {
             <PhoneOff className="w-5 h-5" aria-hidden="true" />
             Leave
           </button>
+
+          {isHost && remotePeer && (
+            <button
+              onClick={() => removeParticipant(remotePeer.participantId)}
+              aria-label="Remove participant from this room"
+              style={{ height: "52px", borderRadius: "26px", border: "1px solid rgba(245,158,11,0.4)", background: "rgba(245,158,11,0.15)", color: "#fbbf24", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 20px", cursor: "pointer", fontWeight: 600, fontSize: "14px" }}
+            >
+              <UserX className="w-5 h-5" aria-hidden="true" />
+              Remove
+            </button>
+          )}
+
+          {isHost && (
+            <button
+              onClick={endCallForEveryone}
+              aria-label="End the call for everyone and close the room"
+              style={{ height: "52px", borderRadius: "26px", border: "none", background: "rgba(239,68,68,0.2)", color: "#fca5a5", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 20px", cursor: "pointer", fontWeight: 600, fontSize: "14px" }}
+            >
+              <PhoneOff className="w-5 h-5" aria-hidden="true" />
+              End for all
+            </button>
+          )}
         </div>
       </div>
 
       <style>{`
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
         @keyframes pulse {
           0%, 100% { transform: scale(1); opacity: 1; }
           50% { transform: scale(1.08); opacity: 0.7; }

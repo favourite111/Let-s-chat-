@@ -83,6 +83,16 @@ components:
         hostName:
           type: string
           description: Optional display name for the host
+        hostParticipantId:
+          type: string
+          description: >-
+            Stable id of the participant creating the room. Stored as the room's
+            owner; ownership is never transferred.
+        hostSecret:
+          type: string
+          description: >-
+            Secret held only by the creator's browser. Only its SHA-256 hash is
+            stored, and it is required to exercise host privileges.
     Room:
       type: object
       properties:
@@ -96,6 +106,9 @@ components:
         createdAt:
           type: string
           format: date-time
+        closed:
+          type: boolean
+          description: The host ended this call; the room accepts no further joins.
       required:
         - id
         - participantCount

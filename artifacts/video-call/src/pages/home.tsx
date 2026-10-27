@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { useCreateRoom, useHealthCheck } from "@workspace/api-client-react";
 import { Video, ArrowRight, Loader2 } from "lucide-react";
 import { toast } from "sonner";
+import { createHostSecret, getParticipantId, storeHostSecret } from "@/lib/identity";
 
 export default function Home() {
   const [, setLocation] = useLocation();
@@ -15,10 +16,19 @@ export default function Home() {
   const createRoom = useCreateRoom();
 
   const handleCreateRoom = () => {
+    // Ownership is a real credential, not the name typed in the box: the
+    // participant id is this browser's stable identity, and the secret is
+    // stored per room so we can prove we are the host after any reload.
+    const participantId = getParticipantId();
+    const hostSecret = createHostSecret();
+
     createRoom.mutate(
-      { data: { hostName: hostName || "Guest" } },
+      { data: { hostName: hostName || "Guest", hostParticipantId: participantId, hostSecret } },
       {
         onSuccess: (room) => {
+          storeHostSecret(room.id, hostSecret);
+          // The room was created *under* this participant id; make sure the
+          // room page presents the same identity.
           setLocation(`/room/${room.id}`);
         },
         onError: () => {
