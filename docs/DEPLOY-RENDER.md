@@ -104,6 +104,13 @@ Render. Don't: that storage does not survive a deploy.
 
 **Calls connect but there's no video on mobile data** — set `TURN_*`. See above.
 
+**`Cannot find package 'better-sqlite3' imported from .../dist/index.mjs`** —
+the image was built with `pnpm prune --prod`. At a workspace root that empties
+`artifacts/api-server/node_modules`, deleting the symlink the server resolves
+the driver through. The image builds, boots, then exits 1. The Dockerfile now
+relinks with `pnpm install --prod --frozen-lockfile` and asserts the import
+resolves during the build, so this cannot ship again.
+
 **`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`** — pnpm trying to purge
 `node_modules` with no TTY to confirm it. Already fixed in the `Dockerfile`
 (`ENV CI=true` plus `--config.confirmModulesPurge=false`). If you see it in your

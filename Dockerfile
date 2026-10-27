@@ -42,8 +42,15 @@ COPY . .
 RUN pnpm --filter @workspace/video-call run build \
  && pnpm --filter @workspace/api-server run build
 
-# Drop devDependencies. Needs NO_PROMPT: see the CI note above.
-RUN pnpm prune --prod --config.confirmModulesPurge=false
+# Drop devDependencies.
+#
+# NOT `pnpm prune --prod`. At a workspace root that empties the SUB-project
+# node_modules - it deletes artifacts/api-server/node_modules, including the
+# symlink to better-sqlite3 that the server resolves at runtime. The container
+# then builds fine, boots, fails to open SQLite and exits 1 (this is what broke
+# the Render deploy). A --prod install relinks each workspace project's
+# production dependencies instead, which is what we actually want.
+RUN pnpm install --prod --frozen-lockfile
 
 # ---- runtime ---------------------------------------------------------------
 FROM node:22-bookworm-slim AS runtime
@@ -58,14 +65,20 @@ ENV NODE_ENV=production \
 # only the native SQLite driver and its prod deps.
 #
 # The *workspace* node_modules matters too: pnpm links better-sqlite3 into
-# artifacts/api-server/node_modules, and the server resolves it from there.
-# Copying only the root folder made SQLite silently fall back to memory.
+# artifacts/api-server/node_modules, and the server resolves it from there. Copy
+# only the root folder and the import fails at startup.
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/artifacts/api-server/node_modules ./artifacts/api-server/node_modules
 COPY --from=build /app/artifacts/api-server/dist ./artifacts/api-server/dist
 COPY --from=build /app/artifacts/video-call/dist ./artifacts/video-call/dist
 COPY --from=build /app/artifacts/api-server/package.json ./artifacts/api-server/package.json
 COPY --from=build /app/package.json ./package.json
+
+# Fail the BUILD, not the deploy, if the native driver cannot be resolved from
+# where the server actually imports it. Without this the image builds happily
+# and the failure only shows up as a crashing container.
+RUN cd artifacts/api-server \
+ && node -e "import('better-sqlite3').then(()=>console.log('better-sqlite3 resolves')).catch(e=>{console.error('better-sqlite3 missing:',e.message);process.exit(1)})"
 
 # Rooms live here when STORE=sqlite. On an ephemeral filesystem (Render) use
 # STORE=postgres + DATABASE_URL instead — this directory is just a fallback.
