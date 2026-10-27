@@ -41,6 +41,14 @@ services:
       # TURN relay — required for calls to connect on mobile data and across
       # restrictive networks. See docs/DEPLOY-TURN.md.
       #
+      # EASIEST FREE OPTION: Cloudflare Realtime TURN, 1 TB/month free.
+      # Create a TURN key in the Cloudflare dashboard and set both values.
+      # The key stays server-side; /api/ice mints short-lived credentials.
+      - key: CLOUDFLARE_TURN_KEY_ID
+        sync: false
+      - key: CLOUDFLARE_TURN_API_TOKEN
+        sync: false
+      #
       # TURN_SECRET is the shared secret from coturn (or your provider); the
       # app mints a short-lived credential per request, so no fixed password
       # is ever handed to clients. Set both in the dashboard.

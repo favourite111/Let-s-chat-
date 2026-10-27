@@ -1,41 +1,66 @@
 import { Router } from "express";
-import { mintTurnCredentials, turnSettingsFromEnv } from "../lib/turn";
+import { logger } from "../lib/logger";
+import {
+  cloudflareSettingsFromEnv,
+  fetchCloudflareIceServers,
+  mintTurnCredentials,
+  turnSettingsFromEnv,
+  type IceServer,
+} from "../lib/turn";
 
 const router = Router();
+
+const STUN_ONLY: IceServer[] = [
+  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+];
 
 /**
  * ICE server configuration, served to clients at runtime.
  *
  * Keeping TURN credentials out of the bundle means a relay can be rotated or
- * replaced without shipping a new frontend.
+ * replaced without shipping a new frontend. Three configurations, first match
+ * wins:
  *
- * Two supported configurations, checked in this order:
+ *  1. Cloudflare Realtime TURN (1 TB/month free):
+ *       CLOUDFLARE_TURN_KEY_ID=...
+ *       CLOUDFLARE_TURN_API_TOKEN=...
  *
- *  1. Time-limited (preferred) — shared secret, per-client credentials:
+ *  2. coturn-style shared secret, per-client credentials:
  *       TURN_URLS="turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349"
  *       TURN_SECRET=<the same static-auth-secret coturn uses>
  *
- *  2. Static — a fixed username/password from a hosting provider:
+ *  3. Static provider credentials:
  *       TURN_URLS=...
  *       TURN_USERNAME=...
  *       TURN_CREDENTIAL=...
  *
- * With a secret, every response carries a different, expiring credential, so
- * the relay cannot be used as a free proxy by anyone who reads this endpoint.
+ * A relay failure must never take the call down with it: if credentials cannot
+ * be obtained we answer with STUN only, which still connects callers who are
+ * directly reachable.
  */
-router.get("/ice", (_req, res) => {
-  const iceServers: Array<{ urls: string | string[]; username?: string; credential?: string }> = [
-    { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
-  ];
+router.get("/ice", async (_req, res) => {
+  const iceServers: IceServer[] = [...STUN_ONLY];
+  let minted = false;
 
-  const settings = turnSettingsFromEnv();
-  if (settings) {
-    iceServers.push(mintTurnCredentials(settings));
+  const cloudflare = cloudflareSettingsFromEnv();
+  if (cloudflare) {
+    try {
+      iceServers.push(...(await fetchCloudflareIceServers(cloudflare)));
+      minted = true;
+    } catch (err) {
+      logger.error({ err }, "Cloudflare TURN credentials unavailable, serving STUN only");
+    }
+  } else {
+    const settings = turnSettingsFromEnv();
+    if (settings) {
+      iceServers.push(mintTurnCredentials(settings));
+      minted = true;
+    }
   }
 
-  // Minted credentials are per-request, so they must not be cached and shared
-  // between users. (They are only valid for TURN_TTL_SECONDS anyway.)
-  res.setHeader("Cache-Control", settings ? "no-store" : "public, max-age=300");
+  // Minted credentials are per-request (Cloudflare's at least are time-boxed),
+  // so they must not be shared between users by an intermediary cache.
+  res.setHeader("Cache-Control", minted ? "no-store" : "public, max-age=300");
   res.json({ iceServers });
 });
 

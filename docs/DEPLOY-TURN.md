@@ -103,21 +103,78 @@ refused.
 they connected: in DevTools → `chrome://webrtc-internals`, the selected
 candidate pair shows `(relay)` on both sides when TURN is carrying the call.
 
-## Hosted providers
+## Free hosted relays (no server of your own)
 
-If you use a provider that issues a fixed username and password instead of a
-shared secret, set these instead of `TURN_SECRET`:
+If you cannot run a VPS, use a hosted relay. The app supports three
+configurations; pick one.
+
+### Option 1 — Cloudflare Realtime TURN (recommended: 1 TB/month free)
+
+The most generous free tier by a wide margin: **1,000 GB per month**, then
+$0.05/GB. Anycast across 330+ cities, so it is close to your users rather than
+in one region. No credit card.
+
+1. Create a free Cloudflare account → dashboard → **Realtime** → **TURN keys**
+   → create a TURN key. Note the **TURN Token ID** and its **API token**.
+2. Set both on your service:
+
+| Key | Value |
+|---|---|
+| `CLOUDFLARE_TURN_KEY_ID` | the TURN key ID |
+| `CLOUDFLARE_TURN_API_TOKEN` | the API token for that key |
+
+Optional: `CLOUDFLARE_TURN_TTL_SECONDS` (default 3600, capped at 48 h).
+
+The key never reaches the browser. The server calls Cloudflare's
+`generate-ice-servers` endpoint and hands the client a short-lived credential,
+cached until five minutes before it expires so ordinary page loads do not burn
+API calls. If Cloudflare is unreachable the endpoint degrades to STUN and logs
+it — a relay outage never takes calls down for people who can connect directly.
+
+### Option 2 — Metered Open Relay (20 GB/month free)
+
+Also free, also no server, but a fifth of Cloudflare's allowance. Sign up at
+[metered.ca/tools/openrelay](https://www.metered.ca/tools/openrelay/) and copy
+the `iceServers` block from the dashboard. It issues a fixed username and
+password, so set:
 
 ```
-TURN_URLS=turn:relay.provider.com:3478
-TURN_USERNAME=<issued username>
-TURN_CREDENTIAL=<issued password>
+TURN_URLS=turn:standard.relay.metered.ca:80,turn:standard.relay.metered.ca:443,turn:standard.relay.metered.ca:443?transport=tcp
+TURN_USERNAME=<from the dashboard>
+TURN_CREDENTIAL=<from the dashboard>
 ```
 
-The app mints time-limited credentials when a secret is present and falls back
-to static ones otherwise. **Prefer the secret form** — with static credentials,
-anyone who loads the page gets your relay password and can push traffic through
-your account.
+**Do not use the `openrelayproject` / `openrelayproject` credentials** that
+appear in almost every WebRTC tutorial. Metered retired that public pair;
+`openrelay.metered.ca` now resolves to `100::1`, the IPv6 discard-only prefix
+(RFC 6666), so the name is deliberately pointed at a blackhole. Calls using it
+never allocate a relay and silently fail to connect. Sign up for a real
+per-account key instead.
+
+### Option 3 — your own coturn
+
+Cheapest at volume and fully under your control, but needs a VPS with a public
+IP and a range of open UDP ports. See the top of this document.
+
+### Which to choose
+
+| | Free allowance | Setup | Notes |
+|---|---|---|---|
+| Cloudflare | **1,000 GB/mo** | Cloudflare account + TURN key | Best free tier; anycast |
+| Metered Open Relay | 20 GB/mo | account, static credentials | Fixed password shared with every client |
+| Own coturn | unlimited (pay the VPS) | ~15 minutes, needs public UDP | Full control, ~$4/mo |
+
+At the adaptive controller's typical 0.5–1.2 Mbit/s per direction, 1,000 GB is
+roughly 1,000–2,000 hours of relayed call per month. For personal use you will
+not come close.
+
+---
+
+The app mints time-limited credentials when a secret is present, uses
+Cloudflare's API when that is configured, and falls back to static credentials
+otherwise. **Prefer a secret or Cloudflare over a static password** — with
+static credentials, anyone who loads the page receives your relay password and
+can push traffic through your account.
 
 ## Why time-limited credentials
 
@@ -172,9 +229,16 @@ the ports are closed at the provider firewall.
 does not match `static-auth-secret` in `/etc/turnserver.conf`. They must be
 identical.
 
-**`/api/ice` shows only STUN** — `TURN_URLS` is unset, empty, or set without
-`TURN_SECRET`/`TURN_USERNAME`. The app deliberately ignores a half-configured
-relay rather than handing clients a server that would reject them.
+**`/api/ice` shows only STUN** — nothing is configured: `TURN_URLS` is unset or
+incomplete (no `TURN_SECRET`/`TURN_USERNAME`), and neither
+`CLOUDFLARE_TURN_KEY_ID` nor `CLOUDFLARE_TURN_API_TOKEN` is set. The app
+deliberately ignores a half-configured relay rather than handing clients a
+server that would reject them.
+
+**`Cloudflare TURN credentials unavailable` in the logs** — the API rejected the
+key or token, or Cloudflare was unreachable. `/api/ice` falls back to STUN, so
+calls still work for directly reachable peers. Check the key ID and that the
+API token belongs to that TURN key.
 
 **Everything connects but the call is slow** — the relay is working but the
 link is weak; the adaptive controller will step the video down. Check

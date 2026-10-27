@@ -12,7 +12,11 @@ export { MemoryPresence } from "./lib/store/presence-memory";
 export { RedisPresence } from "./lib/store/presence-redis";
 export type { PresenceStore, RoomRecord, RoomStore } from "./lib/store/types";
 export {
+  cloudflareSettingsFromEnv,
   deriveTurnCredential,
+  fetchCloudflareIceServers,
   mintTurnCredentials,
+  resetCloudflareCache,
   turnSettingsFromEnv,
 } from "./lib/turn";
+export type { IceServer } from "./lib/turn";
