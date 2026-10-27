@@ -132,6 +132,26 @@ the same id. The newer join wins the seat and the older tab is told
 `session-replaced`, shows "Opened in another window" and releases the camera —
 no silent collision. Opening the link in a new tab does not do this.
 
+### The control model
+
+One red **Leave** button, and everything destructive hangs off it or off the
+host menu — nothing destructive sits next to a button people tap without
+looking.
+
+| Role | Taps Leave | Sees ⋮ |
+|---|---|---|
+| Guest | leaves immediately, exactly as before | no |
+| Host | sheet: **Leave call** (room stays open) or **End for everyone** (red, closes the room) | yes |
+
+The host's `⋮` menu holds the rare actions: **Copy invite link** and
+**Remove <name>** (only while a guest is connected). Removal asks for a second
+confirmation — it is permanent — and only then does the server disconnect them
+and bar them.
+
+The bar itself is three controls (mic, camera, Leave) for both roles, so it no
+longer needs to wrap. Component: `src/components/action-sheet.tsx` (modal
+dialog, Escape/backdrop to close, focus trapped and restored, 48 px+ rows).
+
 ### Socket protocol (server-enforced)
 
 | Direction | Event | Notes |

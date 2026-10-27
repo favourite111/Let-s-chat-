@@ -18,8 +18,11 @@ import {
   RotateCcw,
   UserX,
   Crown,
+  MoreVertical,
+  LogOut,
   PhoneOff as PhoneOffIcon,
 } from "lucide-react";
+import { ActionSheet, type SheetAction } from "@/components/action-sheet";
 import {
   forgetLegacyParticipantId,
   getHostParticipantId,
@@ -120,6 +123,11 @@ export default function Room() {
   const [isHost, setIsHost] = useState(false);
   const [selfParticipantId, setSelfParticipantId] = useState<string | null>(null);
   const [joinAttempt, setJoinAttempt] = useState(0);
+  /**
+   * Which sheet is open. Hosts get a choice when they tap Leave (leave vs end
+   * the room) and a host menu for the rare actions; guests never see either.
+   */
+  const [sheet, setSheet] = useState<null | "leave" | "host" | "confirm-remove">(null);
 
   // WhatsApp-style swap: false = remote is main, true = local is main
   const [isSwapped, setIsSwapped] = useState(false);
@@ -762,6 +770,19 @@ export default function Room() {
     }
   };
 
+  /**
+   * The single red button. Guests leave immediately, exactly as before. A host
+   * gets the sheet, because "leave" and "end it for everyone" are very
+   * different and must not be one mis-tap apart.
+   */
+  const handleLeavePressed = () => {
+    if (!isHost) {
+      leaveCall();
+      return;
+    }
+    setSheet("leave");
+  };
+
   const leaveCall = () => {
     // Tell the server first: this releases the seat immediately instead of
     // leaving a ghost that holds the slot until the ping timeout.
@@ -778,10 +799,6 @@ export default function Room() {
    */
   const endCallForEveryone = () => {
     if (!roomId) return;
-    const ok = window.confirm(
-      "End the call for everyone? The room closes and nobody can rejoin.",
-    );
-    if (!ok) return;
     const socket = socketRef.current;
 
     if (socket?.connected) {
@@ -956,7 +973,9 @@ export default function Room() {
               Room {roomId?.slice(0, 8)}
             </p>
             <p style={{ color: "rgba(255,255,255,0.4)", fontSize: "11px", margin: 0, display: "flex", alignItems: "center", gap: "4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-              <ShieldCheck style={{ width: "10px", height: "10px" }} aria-hidden="true" />
+              <ShieldCheck style={{ width: "10px", height: "10px", flexShrink: 0 }} aria-hidden="true" />
+              {/* On a phone the badge lives here instead of taking its own pill. */}
+              <span className="host-subtitle-label" aria-hidden="true">Host · </span>
               Encrypted in transit · {formatDuration(callSeconds)}
             </p>
           </div>
@@ -967,6 +986,7 @@ export default function Room() {
           {status === "connected" && quality && quality !== "good" && (
             <div
               role="status"
+              className="quality-pill"
               aria-label={`Network quality: ${PROFILES[quality].label}`}
               style={{
                 display: "flex",
@@ -980,7 +1000,7 @@ export default function Room() {
               }}
             >
               <Activity style={{ width: "12px", height: "12px" }} aria-hidden="true" />
-              {PROFILES[quality].label}
+              <span className="quality-label">{PROFILES[quality].label}</span>
             </div>
           )}
           <div
@@ -992,11 +1012,12 @@ export default function Room() {
           </div>
           {isHost && (
             <div
+              className="host-badge"
               aria-label="You are the host"
               style={{ display: "flex", alignItems: "center", gap: "4px", background: "rgba(124,92,252,0.2)", border: "1px solid rgba(124,92,252,0.4)", borderRadius: "20px", padding: "4px 10px", fontSize: "12px", color: "#c4b5fd", fontWeight: 600 }}
             >
               <Crown style={{ width: "12px", height: "12px" }} aria-hidden="true" />
-              Host
+              <span className="host-badge-label">Host</span>
             </div>
           )}
           <button
@@ -1007,6 +1028,20 @@ export default function Room() {
             <Copy style={{ width: "12px", height: "12px" }} aria-hidden="true" />
             <span className="copy-link-label">Copy Link</span>
           </button>
+
+          {/* Rare host actions live here, not in the control bar. */}
+          {isHost && (
+            <button
+              onClick={() => setSheet("host")}
+              aria-label="Host controls"
+              aria-haspopup="dialog"
+              aria-expanded={sheet !== null}
+              data-testid="host-menu-button"
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", width: "32px", height: "32px", background: "rgba(255,255,255,0.1)", border: "none", borderRadius: "20px", color: "rgba(255,255,255,0.75)", cursor: "pointer" }}
+            >
+              <MoreVertical style={{ width: "16px", height: "16px" }} aria-hidden="true" />
+            </button>
+          )}
         </div>
       </div>
 
@@ -1253,48 +1288,110 @@ export default function Room() {
           </button>
 
           <button
-            onClick={leaveCall}
+            onClick={handleLeavePressed}
             aria-label="Leave call"
+            aria-haspopup={isHost ? "dialog" : undefined}
             style={{ height: "52px", borderRadius: "26px", border: "none", background: "linear-gradient(135deg, #ef4444, #dc2626)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 22px", cursor: "pointer", fontWeight: 600, fontSize: "14px", whiteSpace: "nowrap", flex: "0 0 auto", boxShadow: "0 4px 20px rgba(239,68,68,0.4)" }}
           >
             <PhoneOff className="w-5 h-5" aria-hidden="true" />
             <span className="control-label">Leave</span>
           </button>
           </div>
-
-          <div className="call-controls-group" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          {isHost && remotePeer && (
-            <button
-              onClick={() => removeParticipant(remotePeer.participantId)}
-              aria-label="Remove participant from this room"
-              style={{ height: "52px", borderRadius: "26px", border: "1px solid rgba(245,158,11,0.4)", background: "rgba(245,158,11,0.15)", color: "#fbbf24", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 18px", cursor: "pointer", fontWeight: 600, fontSize: "14px", whiteSpace: "nowrap", flex: "0 0 auto" }}
-            >
-              <UserX className="w-5 h-5" aria-hidden="true" />
-              <span className="control-label">Remove</span>
-            </button>
-          )}
-
-          {isHost && (
-            <button
-              onClick={endCallForEveryone}
-              aria-label="End the call for everyone and close the room"
-              style={{ height: "52px", borderRadius: "26px", border: "none", background: "rgba(239,68,68,0.2)", color: "#fca5a5", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 18px", cursor: "pointer", fontWeight: 600, fontSize: "14px", whiteSpace: "nowrap", flex: "0 0 auto" }}
-            >
-              <PhoneOff className="w-5 h-5" aria-hidden="true" />
-              <span className="control-label">End for all</span>
-            </button>
-          )}
-          </div>
         </div>
       </div>
+
+      {/*
+        Host: "Leave" is a question, not an action. Two clearly-worded choices,
+        one of them red — the destructive one is never a neighbour of the button
+        people tap without looking.
+      */}
+      <ActionSheet
+        open={sheet === "leave"}
+        title="Leave this call?"
+        actions={[
+          {
+            id: "leave-call",
+            label: "Leave call",
+            description: "Others stay connected, the room stays open",
+            icon: LogOut,
+            onSelect: leaveCall,
+          },
+          {
+            id: "end-for-everyone",
+            label: "End for everyone",
+            description: "Closes the room for all participants",
+            icon: PhoneOffIcon,
+            tone: "danger",
+            onSelect: endCallForEveryone,
+          },
+        ]}
+        onClose={() => setSheet(null)}
+      />
+
+      {/* Host menu: rare actions, kept out of the control bar. */}
+      <ActionSheet
+        open={sheet === "host"}
+        title="Host controls"
+        description="You own this room."
+        actions={
+          [
+            {
+              id: "copy-link",
+              label: "Copy invite link",
+              description: "Send it to whoever you are calling",
+              icon: Copy,
+              onSelect: () => {
+                void copyLink();
+              },
+            },
+            ...(remotePeer
+              ? [
+                  {
+                    id: "remove-participant",
+                    label: `Remove ${remotePeer.displayName ?? "the other person"}`,
+                    description: "They are disconnected and cannot rejoin",
+                    icon: UserX,
+                    tone: "warning" as const,
+                    onSelect: () => setSheet("confirm-remove"),
+                  },
+                ]
+              : []),
+          ] as SheetAction[]
+        }
+        onClose={() => setSheet(null)}
+      />
+
+      {/* Removing someone is permanent, so it gets its own confirmation. */}
+      <ActionSheet
+        open={sheet === "confirm-remove"}
+        title={`Remove ${remotePeer?.displayName ?? "the other person"}?`}
+        description="They will be disconnected and cannot rejoin this room."
+        actions={[
+          {
+            id: "confirm-remove",
+            label: "Remove from call",
+            icon: UserX,
+            tone: "danger",
+            onSelect: () => {
+              if (remotePeer) removeParticipant(remotePeer.participantId);
+            },
+          },
+        ]}
+        onClose={() => setSheet(null)}
+      />
 
       <style>{`
         /* Phone widths: tighten the spacing first, and drop the wording on the
            host's two secondary actions before anything is allowed to overflow. */
+        .host-subtitle-label { display: none; }
         @media (max-width: 430px) {
+          .host-subtitle-label { display: inline !important; }
           .call-controls { gap: 8px !important; }
-          /* The room name matters more than the words on this button. */
+          /* The room name matters more than the words on these buttons. */
           .copy-link-label { display: none; }
+          .host-badge { display: none !important; }
+          .quality-label { display: none !important; }
+          .quality-pill { padding: 4px 8px !important; }
           .call-controls-group { gap: 8px !important; }
           .call-controls-bar { padding-left: 8px !important; padding-right: 8px !important; }
         }
