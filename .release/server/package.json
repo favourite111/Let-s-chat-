@@ -1,7 +1,7 @@
 {
   "name": "videocall-release",
   "private": true,
-  "version": "0.0.0-b0455af5",
+  "version": "0.0.0-c5c66d8a",
   "type": "module",
   "description": "Prebuilt VideoCall server + frontend",
   "dependencies": {

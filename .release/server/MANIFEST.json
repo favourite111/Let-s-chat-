@@ -1,8 +1,8 @@
 {
   "name": "videocall",
-  "commit": "b0455af5d9ffe973900afad9710fa9e44fe90269",
-  "commitShort": "b0455af5",
-  "builtAt": "2026-10-27T07:15:18.740Z",
+  "commit": "c5c66d8aaed6813fafaf0f13ad4423e8479d3274",
+  "commitShort": "c5c66d8a",
+  "builtAt": "2026-10-27T07:18:27.938Z",
   "node": "v20.20.2",
   "files": 230,
   "bytes": 8486427,

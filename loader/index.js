@@ -494,17 +494,27 @@ async function installPrebuilt(releaseMeta) {
   await restoreInto(STAGING_DIR);
 
   await activate();
+
+  // Trust the manifest inside the archive over the separately downloaded
+  // release.json: they come from different CDN caches and can disagree for a
+  // few minutes after a release is replaced. Recording the wrong commit makes
+  // every restart look "out of date" and reinstall 230 files for nothing.
+  const shipped = readJson(path.join(APP_DIR, "MANIFEST.json"), null);
+  const installedSha = shipped?.commit || releaseMeta?.commit || "unknown";
+  const installedShort =
+    shipped?.commitShort || releaseMeta?.commitShort || installedSha.slice(0, 8);
+
   writeJson(STATE_FILE, {
     mode: "prebuilt",
-    sha: releaseMeta?.commit || "unknown",
+    sha: installedSha,
     branch: CONFIG.branch,
     repo: `${REPO.owner}/${REPO.repo}`,
     deployedAt: new Date().toISOString(),
   });
   say.ok(
-    `Deployed prebuilt ${releaseMeta?.commitShort || ""} from ${REPO.owner}/${REPO.repo}`.trim(),
+    `Deployed prebuilt ${installedShort} from ${REPO.owner}/${REPO.repo}`.trim(),
   );
-  return { updated: true, sha: releaseMeta?.commit || null };
+  return { updated: true, sha: installedSha };
 }
 
 /** Is a prebuilt release usable for this deployment? */
