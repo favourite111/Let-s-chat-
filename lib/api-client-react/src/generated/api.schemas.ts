@@ -25,6 +25,8 @@ export interface Room {
   createdAt: string;
   /** True once the host has ended the call; closed rooms refuse all joins */
   closed?: boolean;
+  /** Whether the host's own seat is occupied right now */
+  hostConnected?: boolean;
 }
 
 export interface ErrorResponse {

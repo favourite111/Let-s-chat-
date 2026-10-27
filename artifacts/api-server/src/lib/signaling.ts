@@ -244,6 +244,18 @@ export function setupSignaling(io: SocketIOServer) {
 
         socket.join(roomId);
 
+        // The seat was held by another live socket (the same identity opened in
+        // a second tab, or a session whose old transport has not been reaped
+        // yet). That older tab is no longer in the call, so tell it instead of
+        // leaving it silently stranded on a dead seat.
+        if (result.previousSocketId && result.previousSocketId !== socket.id) {
+          const previous = io.sockets.sockets.get(result.previousSocketId);
+          if (previous) {
+            previous.emit("session-replaced");
+            previous.leave(roomId);
+          }
+        }
+
         const participants = await roomParticipants(roomId);
         socket.emit("room-joined", {
           roomId,

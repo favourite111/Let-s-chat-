@@ -20,7 +20,12 @@ import {
   Crown,
   PhoneOff as PhoneOffIcon,
 } from "lucide-react";
-import { getHostSecret, getParticipantId } from "@/lib/identity";
+import {
+  forgetLegacyParticipantId,
+  getHostSecret,
+  getParticipantId,
+  resolveJoinIdentity,
+} from "@/lib/identity";
 import {
   AdaptiveVideoController,
   PROFILES,
@@ -40,7 +45,9 @@ type ConnectionStatus =
   /** The host ended the call; the room is closed for good. */
   | "closed"
   /** The host removed this participant; they cannot rejoin. */
-  | "removed";
+  | "removed"
+  /** The same identity joined from somewhere else; this tab is no longer in. */
+  | "replaced";
 
 interface RosterEntry {
   participantId: string;
@@ -182,11 +189,47 @@ export default function Room() {
     let terminal = false;
     let retryTimer: number | null = null;
 
-    const participantId = getParticipantId();
-    // Only the room's creator has one of these; it is what proves ownership.
-    const hostSecret = getHostSecret(roomId);
+    /**
+     * Identity is decided after asking the server one question: is the host
+     * already in the call?
+     *
+     *  - this tab created the room (or holds its secret and the host is gone)
+     *    → present the host identity, so the room stays controllable;
+     *  - the host is connected in another window of this browser → this tab is
+     *    a second participant, which is what makes "open your own link in a
+     *    second window" join as a different person instead of colliding with
+     *    the host's own seat.
+     */
+    let participantId = getParticipantId();
+    let hostSecret = getHostSecret(roomId);
 
-    setSelfParticipantId(participantId);
+    const resolveIdentity = async () => {
+      try {
+        const res = await fetch(`/api/rooms/${roomId}`);
+        if (res.status === 404) {
+          toast.error("That room doesn't exist any more.");
+          setLocation("/");
+          return false;
+        }
+        if (res.ok) {
+          const room = (await res.json()) as { closed?: boolean; hostConnected?: boolean };
+          if (room.closed) {
+            terminal = true;
+            setStatus("closed");
+            return false;
+          }
+          const resolved = resolveJoinIdentity(roomId, Boolean(room.hostConnected));
+          participantId = resolved.participantId;
+          hostSecret = resolved.hostSecret;
+        }
+      } catch {
+        // Offline or the API hiccuped: fall back to this tab's own identity.
+      }
+      setSelfParticipantId(participantId);
+      return true;
+    };
+
+    forgetLegacyParticipantId();
 
     const emitMediaState = () => {
       const socket = socketRef.current;
@@ -301,6 +344,10 @@ export default function Room() {
     };
 
     const start = async () => {
+      // 0. Who is this tab in this room? Decided before the camera is touched,
+      //    so a closed room never turns it on.
+      if (!(await resolveIdentity())) return;
+
       // 1. ICE servers (server-provided, so TURN can change without a rebuild).
       try {
         const res = await fetch("/api/ice");
@@ -440,6 +487,19 @@ export default function Room() {
         terminal = true;
         setStatus("closed");
         // Terminal: turn the hardware off, not just the video element.
+        stopEverything();
+        window.setTimeout(() => socket.disconnect(), 0);
+      });
+
+      /**
+       * This identity was reclaimed by another socket — e.g. the same room
+       * opened in a second tab of a duplicated session. Only one of them can
+       * own the seat; this one stands down rather than pretending to be in a
+       * call it is no longer part of.
+       */
+      socket.on("session-replaced", () => {
+        terminal = true;
+        setStatus("replaced");
         stopEverything();
         window.setTimeout(() => socket.disconnect(), 0);
       });
@@ -706,25 +766,30 @@ export default function Room() {
    * Terminal states. These are not retried: the room is closed or this
    * participant was removed, and the server will refuse a rejoin anyway.
    */
-  if (status === "closed" || status === "removed") {
+  if (status === "closed" || status === "removed" || status === "replaced") {
     const closed = status === "closed";
+    const replaced = status === "replaced";
     return (
       <div style={{ minHeight: "100dvh", background: "#0a0a0f", display: "flex", alignItems: "center", justifyContent: "center", padding: "24px" }}>
         <div style={{ background: "rgba(124,92,252,0.08)", border: "1px solid rgba(124,92,252,0.2)", borderRadius: "20px", padding: "32px", textAlign: "center", maxWidth: "420px", width: "100%" }}>
           <div style={{ width: "64px", height: "64px", borderRadius: "50%", background: closed ? "rgba(239,68,68,0.15)" : "rgba(245,158,11,0.15)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}>
             {closed ? (
               <PhoneOffIcon style={{ color: "#ef4444", width: "28px", height: "28px" }} aria-hidden="true" />
+            ) : replaced ? (
+              <Users style={{ color: "#7c5cfc", width: "28px", height: "28px" }} aria-hidden="true" />
             ) : (
               <UserX style={{ color: "#fbbf24", width: "28px", height: "28px" }} aria-hidden="true" />
             )}
           </div>
           <h2 style={{ color: "#fff", fontSize: "20px", fontWeight: 700, marginBottom: "8px" }}>
-            {closed ? "Call ended" : "You were removed"}
+            {closed ? "Call ended" : replaced ? "Opened in another window" : "You were removed"}
           </h2>
           <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "14px", lineHeight: 1.6 }}>
             {closed
               ? "The host ended this call. This room is closed and cannot be rejoined."
-              : "The host removed you from this room, so you can't rejoin it."}
+              : replaced
+                ? "This room is open in another window or tab, so this one has left the call."
+                : "The host removed you from this room, so you can't rejoin it."}
           </p>
           <Button
             onClick={() => setLocation("/")}

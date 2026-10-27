@@ -41,7 +41,7 @@ curl -s https://let-s-chat-rvgk.onrender.com/api/ice
 - **Opus tuning:** the negotiated SDP carries
   `maxaveragebitrate=32000;stereo=0;usedtx=1;useinbandfec=1`.
 - **Codec preference:** H.264 is negotiated first (hardware encoding on phones).
-- **API suite:** 88 tests, 87 pass, 1 skipped (the Postgres idempotency case
+- **API suite:** 91 tests, 90 pass, 1 skipped (the Postgres idempotency case
   needs a real `DATABASE_URL`).
 - **Identity and host controls, end to end:** 31 checks in a real browser with
   a fake camera, against the production build — reload keeps the same seat,
@@ -82,13 +82,24 @@ expires (2 h idle) and cannot be closed early. That is the deliberate
 consequence of never transferring ownership: there is no recovery path, by
 design.
 
+**Testing two people on one machine:** open the link in a *new tab or window*
+(not "Duplicate tab"), or use a second browser / private window. Each window is
+its own participant; the original host window keeps the Host badge and the
+second one does not.
+
 ## Identities and roles
 
-Every browser mints a **participant id** (`videocall:participant-id`) and keeps
-it forever. That id — not the socket — is what presence is keyed by, so a
-reload or a reconnection reclaims the same seat instead of arriving as a second
-person. This was the ghost-participant bug: counts keyed by socket, and a stale
-socket holding a seat for up to ~50 s.
+**One tab is one participant.** Each tab mints a **participant id** in
+`sessionStorage`, so a reload or a reconnect in that tab reclaims the same seat,
+while a second window is a genuinely different person. That id — not the socket
+— is what presence is keyed by; counts keyed by socket, plus a stale socket
+holding a seat for up to ~50 s, was the ghost-participant bug.
+
+The id used to live in `localStorage`, which every window of a profile shares.
+Pasting your own link into a second Chrome window then joined as *yourself*:
+the same id, the same seat, one participant, and no call to connect to. If you
+see "both windows show 1 person and neither connects", that is what happened —
+check that each window reports a different id.
 
 **Capacity counts connected participants only.** A dropped participant keeps
 their seat (identity) for `PARTICIPANT_GRACE_MS` (45 s) but not a slot, so a
@@ -108,6 +119,19 @@ Ownership survives the host disconnecting, reloading or reconnecting. There is
 no host transfer, automatic or manual, under any circumstances: if the host
 never returns, the room simply expires.
 
+The host's participant id is remembered beside the secret in `localStorage`, so
+**closing the host's window and reopening the link restores host ownership** —
+but only while the host's seat is free. `GET /api/rooms/:id` reports
+`hostConnected`, and a tab that holds the secret uses it to decide: host still
+in the call → join as an ordinary second participant; host gone → reclaim the
+host seat. That keeps "two windows of one browser" working without ever letting
+a second window fight the real host for the seat.
+
+A duplicated tab shares `sessionStorage` with its source, so both would present
+the same id. The newer join wins the seat and the older tab is told
+`session-replaced`, shows "Opened in another window" and releases the camera —
+no silent collision. Opening the link in a new tab does not do this.
+
 ### Socket protocol (server-enforced)
 
 | Direction | Event | Notes |
@@ -115,14 +139,15 @@ never returns, the room simply expires.
 | → server | `join-room {roomId, participantId, hostSecret?, displayName?}` | Re-emitted on every reconnect |
 | ← client | `room-joined {self, participants, reclaimed, isHost}` | |
 | ← client | `room-state {participants, count}` | Roster broadcast on every membership change; connected only |
-| ← client | `join-error {reason}` / `room-full` / `room-closed` / `removed` | `room-full` is the only retryable one |
+| ← client | `join-error {reason}` / `room-full` / `room-closed` / `removed` / `session-replaced` | `room-full` is the only retryable one |
 | ⇄ relay | `offer` / `answer` / `ice-candidate` with `to: participantId` | `from` is added server-side; cross-room relay is dropped |
 | → server | `end-call`, `remove-participant {participantId}` | Host only; secret re-verified server-side, `host-action-error` otherwise |
 | → server | `leave` | Explicit departure: frees the seat now instead of after the grace period |
 
 REST: `DELETE /api/rooms/:id` now needs `x-participant-id` + `x-host-secret` and
 **closes** the room (it no longer deletes the row, so joins can be refused
-afterwards). It also notifies anyone still connected.
+afterwards). It also notifies anyone still connected. `GET /api/rooms/:id`
+returns `closed` and `hostConnected`.
 
 ## Deploying a change
 

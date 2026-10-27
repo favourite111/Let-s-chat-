@@ -109,6 +109,9 @@ components:
         closed:
           type: boolean
           description: The host ended this call; the room accepts no further joins.
+        hostConnected:
+          type: boolean
+          description: Whether the host's own seat is occupied right now.
       required:
         - id
         - participantCount

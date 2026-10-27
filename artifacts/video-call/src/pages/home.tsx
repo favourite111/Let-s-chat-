@@ -5,10 +5,22 @@ import { Input } from "@/components/ui/input";
 import { useCreateRoom, useHealthCheck } from "@workspace/api-client-react";
 import { Video, ArrowRight, Loader2 } from "lucide-react";
 import { toast } from "sonner";
-import { createHostSecret, getParticipantId, storeHostSecret } from "@/lib/identity";
+import {
+  createHostSecret,
+  forgetLegacyParticipantId,
+  getParticipantId,
+  storeHostParticipantId,
+  storeHostSecret,
+} from "@/lib/identity";
 
 export default function Home() {
   const [, setLocation] = useLocation();
+
+  // The participant id used to be shared between tabs; drop the old copy so a
+  // stale id cannot confuse the per-tab identity.
+  React.useEffect(() => {
+    forgetLegacyParticipantId();
+  }, []);
   const [roomCode, setRoomCode] = useState("");
   const [hostName, setHostName] = useState("");
 
@@ -17,8 +29,8 @@ export default function Home() {
 
   const handleCreateRoom = () => {
     // Ownership is a real credential, not the name typed in the box: the
-    // participant id is this browser's stable identity, and the secret is
-    // stored per room so we can prove we are the host after any reload.
+    // participant id is this tab's identity, and the secret is stored per room
+    // so we can prove we are the host after any reload.
     const participantId = getParticipantId();
     const hostSecret = createHostSecret();
 
@@ -27,6 +39,9 @@ export default function Home() {
       {
         onSuccess: (room) => {
           storeHostSecret(room.id, hostSecret);
+          // Remember which identity owns the room, so the owner can reopen it
+          // from another tab after closing this one.
+          storeHostParticipantId(room.id, participantId);
           // The room was created *under* this participant id; make sure the
           // room page presents the same identity.
           setLocation(`/room/${room.id}`);

@@ -287,6 +287,28 @@ describe("Signaling", () => {
     await full;
   });
 
+  it("tells a superseded tab it is no longer in the call", async () => {
+    // The same identity opened twice (a duplicated tab shares sessionStorage):
+    // the second join reclaims the seat, and the first must stand down rather
+    // than sit in a call it is no longer part of.
+    const { room } = await createOwnedRoom();
+    const sharedId = newParticipantId("shared");
+
+    const first = connect();
+    await once(first, "connect");
+    await joinRoom(first, room.id, sharedId);
+
+    const second = connect();
+    await once(second, "connect");
+    const replaced = once(first, "session-replaced");
+    const joined = await joinRoom(second, room.id, sharedId);
+    await replaced;
+
+    const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(detail.participantCount, 1, "one seat, not two");
+    assert.equal(joined.participants.filter((p) => p.connected).length, 1);
+  });
+
   it("lets two people join when one of them reloads mid-join", async () => {
     const { room, owner } = await createOwnedRoom();
     const host = owner.participantId;
@@ -306,12 +328,22 @@ describe("Signaling", () => {
     await once(b2, "connect");
     const joined = await joinRoom(b2, room.id, guest);
 
-    assert.equal(joined.participants.filter((p) => p.connected).length, 2);
+    // The dying socket may still be shutting down as this join lands; what must
+    // hold is that the room settles at two connected people, not one.
+    let connected = 0;
+    for (let i = 0; i < 40; i += 1) {
+      const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+      connected = detail.participantCount;
+      if (connected === 2) break;
+      await delay(100);
+    }
+    assert.equal(connected, 2, "both people are counted once the dust settles");
     assert.equal(joined.isHost, false);
-
-    // Both sides see each other.
-    const roster = await onceWhere(b2, "room-state", (state) => state.count === 2);
-    assert.equal(roster.count, 2);
+    assert.equal(
+      joined.participants.some((p) => p.participantId === host && p.role === "host"),
+      true,
+      "the reloading guest sees the host in the roster",
+    );
   });
 
   it("keeps participantCount in sync with the socket layer", async () => {
@@ -548,6 +580,60 @@ describe("Host controls over the socket", () => {
     // The host is still there.
     const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
     assert.equal(detail.participantCount, 2);
+  });
+
+  it("reports whether the host seat is occupied", async () => {
+    const { room, owner } = await createOwnedRoom();
+
+    assert.equal(
+      (await (await fetch(`${BASE}/api/rooms/${room.id}`)).json()).hostConnected,
+      false,
+      "nobody in the room yet",
+    );
+
+    const host = connect();
+    await once(host, "connect");
+    await joinRoom(host, room.id, owner.participantId, { hostSecret: owner.secret });
+    assert.equal(
+      (await (await fetch(`${BASE}/api/rooms/${room.id}`)).json()).hostConnected,
+      true,
+    );
+
+    host.disconnect();
+    await delay(400);
+    assert.equal(
+      (await (await fetch(`${BASE}/api/rooms/${room.id}`)).json()).hostConnected,
+      false,
+      "the seat is free again, so another tab may take it back",
+    );
+  });
+
+  it("ignores the host secret when it arrives under a different identity", async () => {
+    // This is the second window of the host's own browser: it holds the secret,
+    // but the host is already in the call under another participant id. It must
+    // join as an ordinary participant — never as a second host fighting over
+    // one seat.
+    const { room, owner } = await createOwnedRoom();
+    const secondWindowId = newParticipantId("window2");
+
+    const host = connect();
+    await once(host, "connect");
+    await joinRoom(host, room.id, owner.participantId, { hostSecret: owner.secret });
+
+    const second = connect();
+    await once(second, "connect");
+    const joined = await joinRoom(second, room.id, secondWindowId, {
+      hostSecret: owner.secret,
+    });
+
+    assert.equal(joined.isHost, false, "a secret alone does not grant this seat");
+    const roster = await onceWhere(host, "room-state", (state) => state.count === 2);
+    assert.equal(roster.participants.length, 2, "two distinct people, not one seat twice");
+
+    // And it cannot act as host.
+    const refused = once(second, "host-action-error");
+    second.emit("end-call");
+    assert.equal((await refused).reason, "not-host");
   });
 
   it("keeps the host's ownership through a reconnect", async () => {

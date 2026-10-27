@@ -63,6 +63,14 @@ export interface PublicRoom {
   createdAt: string;
   /** The host ended this call; nobody can join it again. */
   closed: boolean;
+  /**
+   * Whether the host's own seat is occupied right now.
+   *
+   * Used by the client to tell "the host is already in another window" from
+   * "the host is gone": only in the second case may a new tab that holds the
+   * host secret present the host identity and keep the room controllable.
+   */
+  hostConnected: boolean;
   /** The person joining is the host. Only ever true for the host's own view. */
   isHost?: boolean;
 }
@@ -209,12 +217,19 @@ export async function getRoom(roomId: string): Promise<RoomRecord | undefined> {
 
 export async function toPublicRoom(room: RoomRecord): Promise<PublicRoom> {
   const { presence } = requireService();
+
+  const hostSeat =
+    room.hostParticipantId !== null
+      ? await presence.get(room.id, room.hostParticipantId)
+      : undefined;
+
   return {
     id: room.id,
     hostName: room.hostName,
     participantCount: await presence.countConnected(room.id),
     createdAt: room.createdAt.toISOString(),
     closed: room.closedAt !== null,
+    hostConnected: Boolean(hostSeat && hostSeat.socketId !== null),
   };
 }
 
@@ -228,6 +243,34 @@ export function toPublicParticipants(participants: ParticipantRecord[]): PublicP
 }
 
 // ─── joining ────────────────────────────────────────────────────────────────
+
+/**
+ * Serialise joins per room.
+ *
+ * Two joins for the *same* participant can overlap when a socket is dying while
+ * its replacement connects (the reload case). Both read the same presence
+ * record, and without ordering the older join could write its dead socket id
+ * back over the new one — the seat would then look occupied by a socket that no
+ * longer exists. Joins are cheap, so a per-room queue costs nothing and makes
+ * the outcome depend on arrival order instead of on timing luck.
+ */
+const joinQueues = new Map<string, Promise<unknown>>();
+
+async function withJoinLock<T>(roomId: string, work: () => Promise<T>): Promise<T> {
+  const previous = joinQueues.get(roomId) ?? Promise.resolve();
+  const run = previous.then(work, work);
+  // Keep the chain alive even if this join rejects, then drop it once idle.
+  const settled = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  joinQueues.set(roomId, settled);
+  try {
+    return await run;
+  } finally {
+    if (joinQueues.get(roomId) === settled) joinQueues.delete(roomId);
+  }
+}
 
 /** Socket ids are opaque, but an empty one means "connected to nothing". */
 function isNonEmptySocketId(raw: unknown): raw is string {
@@ -257,6 +300,12 @@ export type JoinResult =
       isHost: boolean;
       /** True when this join reclaimed an existing seat instead of taking one. */
       reclaimed: boolean;
+      /**
+       * The socket that held this seat before the reclaim, if any. The caller
+       * uses it to tell a superseded tab that it is no longer in the call —
+       * which is what happens when the same identity is opened twice.
+       */
+      previousSocketId: string | null;
       others: ParticipantRecord[];
     }
   | { ok: false; reason: JoinFailure };
@@ -284,6 +333,12 @@ export async function purgeStaleParticipants(roomId: string, graceMs = GRACE_MS)
 }
 
 export async function joinRoom(roomId: string, input: JoinInput): Promise<JoinResult> {
+  // Everything below reads and then writes the same presence record; the queue
+  // keeps two joins for one room from interleaving.
+  return withJoinLock(roomId, () => joinRoomLocked(roomId, input));
+}
+
+async function joinRoomLocked(roomId: string, input: JoinInput): Promise<JoinResult> {
   const { store, presence } = requireService();
 
   // Validate here as well as in the socket layer: this is the function that
@@ -349,6 +404,7 @@ export async function joinRoom(roomId: string, input: JoinInput): Promise<JoinRe
       participant,
       isHost,
       reclaimed: true,
+      previousSocketId: existing.socketId,
       others: await otherParticipants(roomId, participantId),
     };
   }
@@ -394,6 +450,7 @@ export async function joinRoom(roomId: string, input: JoinInput): Promise<JoinRe
     participant,
     isHost,
     reclaimed: false,
+    previousSocketId: null,
     others: await otherParticipants(roomId, participantId),
   };
 }

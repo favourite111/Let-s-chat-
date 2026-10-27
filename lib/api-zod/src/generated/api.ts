@@ -50,4 +50,5 @@ export const GetRoomResponse = zod.object({
   participantCount: zod.number(),
   createdAt: zod.coerce.date(),
   closed: zod.boolean().optional(),
+  hostConnected: zod.boolean().optional(),
 });
