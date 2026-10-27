@@ -72,6 +72,10 @@ the web service *and* a Postgres database and wires them together — see
 Step-by-step for Docker, bare Node + systemd, and the loader — plus nginx + HTTPS
 + coturn: **[`docs/DEPLOY-VPS.md`](docs/DEPLOY-VPS.md)**.
 
+**TURN (relay):** for calls to connect on mobile data, between networks, or
+behind restrictive wifi, you need a relay — see **[`docs/DEPLOY-TURN.md`](docs/DEPLOY-TURN.md)**.
+Without it, calls only connect when one side happens to be directly reachable.
+
 ## Storage
 
 Three backends, one interface; the app picks one at boot.

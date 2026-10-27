@@ -38,10 +38,18 @@ services:
       # https://videocall.onrender.com
       - key: CORS_ORIGINS
         sync: false
-      # TURN relay — strongly recommended for mobile networks. Set these in the
-      # dashboard (they are secrets):
+      # TURN relay — required for calls to connect on mobile data and across
+      # restrictive networks. See docs/DEPLOY-TURN.md.
+      #
+      # TURN_SECRET is the shared secret from coturn (or your provider); the
+      # app mints a short-lived credential per request, so no fixed password
+      # is ever handed to clients. Set both in the dashboard.
       - key: TURN_URLS
         sync: false
+      - key: TURN_SECRET
+        sync: false
+      # Hosted providers that issue a fixed username/password instead of a
+      # secret: set these two instead of TURN_SECRET.
       - key: TURN_USERNAME
         sync: false
       - key: TURN_CREDENTIAL

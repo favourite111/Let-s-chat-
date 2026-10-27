@@ -11,3 +11,8 @@ export { PostgresRoomStore } from "./lib/store/postgres";
 export { MemoryPresence } from "./lib/store/presence-memory";
 export { RedisPresence } from "./lib/store/presence-redis";
 export type { PresenceStore, RoomRecord, RoomStore } from "./lib/store/types";
+export {
+  deriveTurnCredential,
+  mintTurnCredentials,
+  turnSettingsFromEnv,
+} from "./lib/turn";

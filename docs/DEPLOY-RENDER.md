@@ -55,6 +55,7 @@ and it overrides the image. Pinning a different port is exactly what produces
 | start | `node artifacts/api-server/dist/index.mjs` (the image's `CMD`) | One process serves the API **and** the built frontend. |
 | health check | `/api/healthz` | Render restarts the service if it stops answering. |
 | `TRUST_PROXY` | `1` | Render terminates TLS in front of the app. |
+| `TURN_URLS` + `TURN_SECRET` | unset | Relay for calls between networks. Without it, mobile-data calls fail to connect. See [`DEPLOY-TURN.md`](DEPLOY-TURN.md). |
 
 ## 2. Set these in the dashboard (Environment)
 
@@ -102,7 +103,8 @@ service. Dashboard → your service → Environment → confirm `DATABASE_URL` e
 **`Cannot open the SQLite database`** — you overrode `STORE` to `sqlite` on
 Render. Don't: that storage does not survive a deploy.
 
-**Calls connect but there's no video on mobile data** — set `TURN_*`. See above.
+**Calls connect but there's no video on mobile data** — set `TURN_*`. See
+[`DEPLOY-TURN.md`](DEPLOY-TURN.md); a relay is the only fix for carrier NAT.
 
 **`Cannot find package 'better-sqlite3' imported from .../dist/index.mjs`** —
 the image was built with `pnpm prune --prod`. At a workspace root that empties
