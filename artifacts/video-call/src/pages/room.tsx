@@ -4,6 +4,7 @@ import { io, type Socket } from "socket.io-client";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
+  Activity,
   Mic,
   MicOff,
   Video as VideoIcon,
@@ -16,8 +17,22 @@ import {
   WifiOff,
   RotateCcw,
 } from "lucide-react";
+import {
+  AdaptiveVideoController,
+  PROFILES,
+  preferHardwareCodecs,
+  tuneOpusSdp,
+  type QualityLevel,
+} from "@/lib/rtc-quality";
 
 type ConnectionStatus = "connecting" | "waiting" | "connected" | "reconnecting" | "failed";
+
+const QUALITY_COLOR: Record<QualityLevel, string> = {
+  good: "#22c55e",
+  fair: "#eab308",
+  poor: "#f97316",
+  bad: "#ef4444",
+};
 
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
@@ -55,6 +70,7 @@ export default function Room() {
   const iceBufferRef = useRef<RTCIceCandidateInit[]>([]);
   const remoteDescSetRef = useRef(false);
   const audioOnlyRef = useRef(false);
+  const qualityRef = useRef<AdaptiveVideoController | null>(null);
   // Mirrors of state so socket callbacks always read current values.
   const isMutedRef = useRef(false);
   const isVideoOffRef = useRef(false);
@@ -68,6 +84,7 @@ export default function Room() {
   const [mediaError, setMediaError] = useState<string | null>(null);
   const [audioOnlyMode, setAudioOnlyMode] = useState(false);
   const [callSeconds, setCallSeconds] = useState(0);
+  const [quality, setQuality] = useState<QualityLevel | null>(null);
 
   // WhatsApp-style swap: false = remote is main, true = local is main
   const [isSwapped, setIsSwapped] = useState(false);
@@ -159,6 +176,11 @@ export default function Room() {
         stream.getTracks().forEach((track) => pc.addTrack(track, stream));
       }
 
+      // Offer hardware-accelerated H.264 before VP9/AV1. Software-encoding a
+      // modern codec on a cheap phone is what makes a call stutter and drains
+      // the battery that was holding the connection up.
+      preferHardwareCodecs(pc);
+
       pc.ontrack = (event) => {
         const [remoteStream] = event.streams;
         if (remoteVideoRef.current && remoteStream) {
@@ -211,6 +233,18 @@ export default function Room() {
           console.warn("Dropping buffered ICE candidate", err);
         }
       }
+    };
+
+    /**
+     * Start the adaptive quality loop for this peer connection: it measures the
+     * link every couple of seconds and moves the video profile up or down to
+     * match, instead of letting the encoder overrun a weak connection.
+     */
+    const startQualityLoop = (pc: RTCPeerConnection) => {
+      qualityRef.current?.stop();
+      const controller = new AdaptiveVideoController();
+      qualityRef.current = controller;
+      controller.start(pc, setQuality);
     };
 
     const start = async () => {
@@ -304,8 +338,11 @@ export default function Room() {
         const pc = createPeer(socket);
         try {
           const offer = await pc.createOffer();
+          // Opus tuning has to happen in the SDP text — there is no API for it.
+          offer.sdp = tuneOpusSdp(offer.sdp ?? "");
           await pc.setLocalDescription(offer);
           socket.emit("offer", { offer, to: userId });
+          startQualityLoop(pc);
         } catch (err) {
           console.error("Error creating offer", err);
         }
@@ -320,8 +357,10 @@ export default function Room() {
             await pc.setRemoteDescription(new RTCSessionDescription(offer));
             await flushCandidates(pc);
             const answer = await pc.createAnswer();
+            answer.sdp = tuneOpusSdp(answer.sdp ?? "");
             await pc.setLocalDescription(answer);
             socket.emit("answer", { answer, to: from });
+            startQualityLoop(pc);
           } catch (err) {
             console.error("Error handling offer", err);
           }
@@ -334,6 +373,7 @@ export default function Room() {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(answer));
           await flushCandidates(pc);
+          startQualityLoop(pc);
         } catch (err) {
           console.error("Error handling answer", err);
         }
@@ -368,6 +408,9 @@ export default function Room() {
         setRemoteVideoOff(false);
         remoteUserIdRef.current = null;
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+        qualityRef.current?.stop();
+        qualityRef.current = null;
+        setQuality(null);
         pcRef.current?.close();
         pcRef.current = null;
         setStatus("waiting");
@@ -380,6 +423,8 @@ export default function Room() {
       cancelled = true;
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
+      qualityRef.current?.stop();
+      qualityRef.current = null;
       pcRef.current?.close();
       pcRef.current = null;
       socketRef.current?.disconnect();
@@ -528,6 +573,26 @@ export default function Room() {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexShrink: 0 }}>
+          {/* Only shown when the link has degraded — otherwise it is noise. */}
+          {status === "connected" && quality && quality !== "good" && (
+            <div
+              role="status"
+              aria-label={`Network quality: ${PROFILES[quality].label}`}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "4px",
+                background: "rgba(255,255,255,0.1)",
+                borderRadius: "20px",
+                padding: "4px 10px",
+                fontSize: "12px",
+                color: QUALITY_COLOR[quality],
+              }}
+            >
+              <Activity style={{ width: "12px", height: "12px" }} aria-hidden="true" />
+              {PROFILES[quality].label}
+            </div>
+          )}
           <div
             aria-label={`${hasRemoteVideo ? 2 : 1} participants`}
             style={{ display: "flex", alignItems: "center", gap: "4px", background: "rgba(255,255,255,0.1)", borderRadius: "20px", padding: "4px 10px", fontSize: "12px", color: "rgba(255,255,255,0.7)" }}
