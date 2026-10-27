@@ -134,15 +134,29 @@ it — a relay outage never takes calls down for people who can connect directly
 ### Option 2 — Metered Open Relay (20 GB/month free)
 
 Also free, also no server, but a fifth of Cloudflare's allowance. Sign up at
-[metered.ca/tools/openrelay](https://www.metered.ca/tools/openrelay/) and copy
-the `iceServers` block from the dashboard. It issues a fixed username and
-password, so set:
+[metered.ca/tools/openrelay](https://www.metered.ca/tools/openrelay/).
+
+**Preferred: use the API key**, so nothing but the result reaches the browser:
+
+| Key | Value |
+|---|---|
+| `METERED_API_KEY` | the account API key from the dashboard |
+
+The server calls `omo.metered.live/api/v1/turn/credentials`, caches the result,
+and serves it from `/api/ice`. The key never leaves the server.
+
+If you would rather not use the API, the fixed pair also works:
 
 ```
-TURN_URLS=turn:standard.relay.metered.ca:80,turn:standard.relay.metered.ca:443,turn:standard.relay.metered.ca:443?transport=tcp
+TURN_URLS=turn:global.relay.metered.ca:80,turn:global.relay.metered.ca:80?transport=tcp,turn:global.relay.metered.ca:443,turns:global.relay.metered.ca:443?transport=tcp
 TURN_USERNAME=<from the dashboard>
 TURN_CREDENTIAL=<from the dashboard>
 ```
+
+Note that Metered's free tier issues a **static** username/password, so every
+visitor to `/api/ice` receives the same one. Keep it out of public repos, and
+rotate it from the dashboard if it leaks. Cloudflare's scheme does not have
+this weakness, which is why it is the recommendation.
 
 **Do not use the `openrelayproject` / `openrelayproject` credentials** that
 appear in almost every WebRTC tutorial. Metered retired that public pair;

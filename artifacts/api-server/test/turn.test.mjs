@@ -19,6 +19,9 @@ import {
   cloudflareSettingsFromEnv,
   deriveTurnCredential,
   fetchCloudflareIceServers,
+  fetchMeteredIceServers,
+  meteredSettingsFromEnv,
+  resetMeteredCache,
   mintTurnCredentials,
   resetCloudflareCache,
   turnSettingsFromEnv,
@@ -253,6 +256,80 @@ describe("Cloudflare TURN", () => {
     };
     await assert.rejects(() => fetchCloudflareIceServers(settings, flaky));
     const servers = await fetchCloudflareIceServers(settings, flaky);
+    assert.equal(calls, 2);
+    assert.ok(servers.length > 0);
+  });
+});
+
+describe("Metered TURN", () => {
+  const cfBody = [
+    { urls: "stun:stun.relay.metered.ca:80" },
+    { urls: "turn:global.relay.metered.ca:80", username: "acct", credential: "pw" },
+    { urls: "turn:global.relay.metered.ca:53", username: "acct", credential: "pw" },
+    { urls: "turns:global.relay.metered.ca:443?transport=tcp", username: "acct", credential: "pw" },
+  ];
+
+  const fake = (body, ok = true, status = 200) => ({
+    ok, status, json: async () => body, text: async () => JSON.stringify(body),
+  });
+
+  it("reads the API key only when set", () => {
+    assert.equal(meteredSettingsFromEnv({}), null);
+    const s = meteredSettingsFromEnv({ METERED_API_KEY: "k123" });
+    assert.equal(s.apiKey, "k123");
+    assert.equal(s.ttlSeconds, 3600);
+  });
+
+  it("calls the documented endpoint with the key and parses the array shape", async () => {
+    resetMeteredCache();
+    let seen = null;
+    const servers = await fetchMeteredIceServers(
+      { apiKey: "k123", ttlSeconds: 3600 },
+      async (url) => { seen = url; return fake(cfBody); },
+    );
+    assert.match(seen, /omo\.metered\.live\/api\/v1\/turn\/credentials/);
+    assert.match(seen, /apiKey=k123/);
+    // Port 53 dropped, the rest kept.
+    assert.ok(!JSON.stringify(servers).includes(":53"), "no port 53 URL");
+    assert.equal(servers.filter((s) => s.username).length, 2);
+  });
+
+  it("accepts the {iceServers:[...]} shape too", async () => {
+    resetMeteredCache();
+    const servers = await fetchMeteredIceServers(
+      { apiKey: "k", ttlSeconds: 3600 },
+      async () => fake({ iceServers: cfBody }),
+    );
+    assert.ok(servers.length > 0);
+  });
+
+  it("caches and single-flights like the Cloudflare path", async () => {
+    resetMeteredCache();
+    let calls = 0, now = 1_000_000;
+    const stub = async () => { calls++; await new Promise((r) => setTimeout(r, 15)); return fake(cfBody); };
+    const settings = { apiKey: "k", ttlSeconds: 3600 };
+
+    await Promise.all([
+      fetchMeteredIceServers(settings, stub, () => now),
+      fetchMeteredIceServers(settings, stub, () => now),
+    ]);
+    assert.equal(calls, 1, "concurrent misses collapse");
+
+    await fetchMeteredIceServers(settings, stub, () => now);
+    assert.equal(calls, 1, "served from cache");
+
+    now += (3600 - 300) * 1000 + 1000;
+    await fetchMeteredIceServers(settings, stub, () => now);
+    assert.equal(calls, 2, "refreshed after the margin");
+  });
+
+  it("throws on failure and does not cache it", async () => {
+    resetMeteredCache();
+    let calls = 0;
+    const stub = async () => { calls++; return calls === 1 ? fake({ error: "bad key" }, false, 401) : fake(cfBody); };
+    const settings = { apiKey: "k", ttlSeconds: 3600 };
+    await assert.rejects(() => fetchMeteredIceServers(settings, stub), /401/);
+    const servers = await fetchMeteredIceServers(settings, stub);
     assert.equal(calls, 2);
     assert.ok(servers.length > 0);
   });

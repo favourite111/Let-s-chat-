@@ -39,6 +39,11 @@ export interface TurnSettings {
   ttlSeconds: number;
 }
 
+export interface MeteredSettings {
+  apiKey: string;
+  ttlSeconds: number;
+}
+
 export interface CloudflareTurnSettings {
   keyId: string;
   apiToken: string;
@@ -89,6 +94,18 @@ export function turnSettingsFromEnv(env: NodeJS.ProcessEnv = process.env): TurnS
   // URLs without any credentials: the relay would reject every request, so
   // treat it as unconfigured rather than handing clients a broken server.
   return null;
+}
+
+/**
+ * Read Metered (Open Relay) settings.
+ *
+ * Metered's REST API returns a ready iceServers array for the account, so the
+ * API key stays on the server and the browser only ever sees the result.
+ */
+export function meteredSettingsFromEnv(env: NodeJS.ProcessEnv = process.env): MeteredSettings | null {
+  const apiKey = env["METERED_API_KEY"];
+  if (!apiKey) return null;
+  return { apiKey, ttlSeconds: positiveInt(env["METERED_TTL_SECONDS"], DEFAULT_TTL_SECONDS) };
 }
 
 /** Read Cloudflare TURN settings. Null unless both halves of the key are set. */
@@ -216,6 +233,72 @@ export async function fetchCloudflareIceServers(
     return await inFlight;
   } finally {
     inFlight = null;
+  }
+}
+
+const DEFAULT_METERED_API = "https://omo.metered.live/api/v1/turn/credentials";
+
+function meteredApiBase(env: NodeJS.ProcessEnv = process.env): string {
+  return env["METERED_API_BASE"]?.replace(/\/+$/, "") || DEFAULT_METERED_API;
+}
+
+let meteredCache: { servers: IceServer[]; expiresAt: number } | null = null;
+let meteredInFlight: Promise<IceServer[]> | null = null;
+
+/** Testing seam. */
+export function resetMeteredCache(): void {
+  meteredCache = null;
+  meteredInFlight = null;
+}
+
+/**
+ * Fetch this account's iceServers from Metered.
+ *
+ * Metered currently hands out long-lived credentials per account, but the
+ * endpoint is the documented way in and is what will rotate them if they ever
+ * do — so we call it and cache, rather than baking the pair into config.
+ * Throws on failure; the caller degrades to STUN.
+ */
+export async function fetchMeteredIceServers(
+  settings: MeteredSettings,
+  fetchImpl: typeof fetch = fetch,
+  nowMs: () => number = Date.now,
+): Promise<IceServer[]> {
+  if (meteredCache && nowMs() < meteredCache.expiresAt) return meteredCache.servers;
+  if (meteredInFlight) return meteredInFlight;
+
+  const url = `${meteredApiBase()}/?apiKey=${encodeURIComponent(settings.apiKey)}`;
+
+  meteredInFlight = (async () => {
+    const res = await fetchImpl(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Metered TURN returned ${res.status}: ${body.slice(0, 200)}`);
+    }
+
+    const data = (await res.json()) as IceServer[] | { iceServers?: IceServer[] };
+    const list = Array.isArray(data) ? data : (data.iceServers ?? []);
+
+    const servers = list
+      .map((server) => {
+        const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+        return { ...server, urls: urls.filter((u) => !usesBlockedPort(u)) };
+      })
+      .filter((server) =>
+        Array.isArray(server.urls) ? server.urls.length > 0 : Boolean(server.urls),
+      );
+
+    if (servers.length === 0) throw new Error("Metered TURN returned no usable iceServers");
+
+    const lifetime = Math.max(60, settings.ttlSeconds - REFRESH_MARGIN_SECONDS);
+    meteredCache = { servers, expiresAt: nowMs() + lifetime * 1000 };
+    return servers;
+  })();
+
+  try {
+    return await meteredInFlight;
+  } finally {
+    meteredInFlight = null;
   }
 }
 

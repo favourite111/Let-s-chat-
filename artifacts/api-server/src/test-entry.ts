@@ -13,6 +13,9 @@ export { RedisPresence } from "./lib/store/presence-redis";
 export type { PresenceStore, RoomRecord, RoomStore } from "./lib/store/types";
 export {
   cloudflareSettingsFromEnv,
+  fetchMeteredIceServers,
+  meteredSettingsFromEnv,
+  resetMeteredCache,
   deriveTurnCredential,
   fetchCloudflareIceServers,
   mintTurnCredentials,

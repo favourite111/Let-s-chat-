@@ -3,6 +3,8 @@ import { logger } from "../lib/logger";
 import {
   cloudflareSettingsFromEnv,
   fetchCloudflareIceServers,
+  fetchMeteredIceServers,
+  meteredSettingsFromEnv,
   mintTurnCredentials,
   turnSettingsFromEnv,
   type IceServer,
@@ -25,11 +27,14 @@ const STUN_ONLY: IceServer[] = [
  *       CLOUDFLARE_TURN_KEY_ID=...
  *       CLOUDFLARE_TURN_API_TOKEN=...
  *
- *  2. coturn-style shared secret, per-client credentials:
+ *  2. Metered Open Relay (20 GB/month free):
+ *       METERED_API_KEY=...
+ *
+ *  3. coturn-style shared secret, per-client credentials:
  *       TURN_URLS="turn:turn.example.com:3478?transport=udp,turns:turn.example.com:5349"
  *       TURN_SECRET=<the same static-auth-secret coturn uses>
  *
- *  3. Static provider credentials:
+ *  4. Static provider credentials:
  *       TURN_URLS=...
  *       TURN_USERNAME=...
  *       TURN_CREDENTIAL=...
@@ -43,12 +48,21 @@ router.get("/ice", async (_req, res) => {
   let minted = false;
 
   const cloudflare = cloudflareSettingsFromEnv();
+  const metered = meteredSettingsFromEnv();
+
   if (cloudflare) {
     try {
       iceServers.push(...(await fetchCloudflareIceServers(cloudflare)));
       minted = true;
     } catch (err) {
       logger.error({ err }, "Cloudflare TURN credentials unavailable, serving STUN only");
+    }
+  } else if (metered) {
+    try {
+      iceServers.push(...(await fetchMeteredIceServers(metered)));
+      minted = true;
+    } catch (err) {
+      logger.error({ err }, "Metered TURN credentials unavailable, serving STUN only");
     }
   } else {
     const settings = turnSettingsFromEnv();
