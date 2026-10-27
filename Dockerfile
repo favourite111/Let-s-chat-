@@ -19,7 +19,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-RUN corepack enable && corepack prepare pnpm@10.34.9 --activate
+# npm rather than corepack: corepack's bundled signing keys go stale and fail
+# with "Cannot find matching keyid" on some Node images.
+RUN npm install -g pnpm@10.34.9 --no-audit --no-fund
 
 # Manifests first, so this layer is cached until dependencies actually change.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./

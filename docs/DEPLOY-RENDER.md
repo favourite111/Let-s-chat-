@@ -8,12 +8,42 @@ the web service **and** the Postgres database, wired together.
 1. Push this repo to GitHub (already done).
 2. Render dashboard → **New** → **Blueprint**.
 3. Pick the repository. Render reads `render.yaml` and shows:
-   * `videocall` — Web Service (Node)
+   * `videocall` — Web Service (Docker)
    * `videocall-db` — PostgreSQL (free)
 4. **Apply**. Render provisions the database first, injects `DATABASE_URL`
-   into the service, installs with pnpm, builds, and starts.
+   into the service, builds the image, and starts.
 
-First deploy takes ~3–5 minutes. When it's live, open the `.onrender.com` URL.
+First deploy takes ~4–8 minutes (the image compiles the native SQLite driver).
+When it's live, open the `.onrender.com` URL.
+
+## Which runtime is my service using?
+
+There are two supported ways to build this, and knowing which one you have
+saves an hour of confusion:
+
+| | Docker | Native Node |
+|---|---|---|
+| Uses | the repo's `Dockerfile` | Render's `buildCommand` |
+| Shown in dashboard | **Settings → Dockerfile Path** is filled in | **Build & Deploy → Build Command** is filled in |
+| Configured by | `runtime: docker` in `render.yaml` | `runtime: node` in `render.yaml` |
+
+A service that was **created by hand** (New → Web Service) picks the Dockerfile
+automatically when it finds one, and then **ignores `render.yaml` entirely** —
+including `STORE=postgres`. That is the most common way to end up on SQLite
+with rooms that vanish on every deploy.
+
+If your service was created by hand, either:
+
+* **Apply the blueprint** (New → Blueprint → same repo) and let it create the
+  service and database with all variables wired, then delete the hand-made
+  one; or
+* **Set the variables yourself**: Dashboard → your service → Environment, add
+  `STORE=postgres`, `DATABASE_URL` (copy it from the Postgres instance's
+  *Connections* page), `NODE_ENV=production`, `TRUST_PROXY=1`.
+
+Either way, do **not** add `PORT` yourself. Render injects it (default `10000`)
+and it overrides the image. Pinning a different port is exactly what produces
+`Port scan timeout reached, no open ports detected`.
 
 ## What the blueprint sets
 
@@ -21,8 +51,8 @@ First deploy takes ~3–5 minutes. When it's live, open the `.onrender.com` URL.
 |---|---|---|
 | `STORE` | `postgres` | Render's disk is wiped on every deploy. Forcing Postgres means the server **refuses to boot** if the database is unreachable, instead of silently writing rooms to a file that will disappear. |
 | `DATABASE_URL` | from `videocall-db` | Injected automatically; the `rooms` table is created on first boot — no migrations. |
-| build | `pnpm install --frozen-lockfile` + build both packages | `PORT`/`BASE_PATH` are provided so the Vite config doesn't throw. |
-| start | `node artifacts/api-server/dist/index.mjs` | One process serves the API **and** the built frontend. |
+| build | the repo's `Dockerfile` | Multi-stage: builds the frontend and the server bundle, then ships only compiled output plus production dependencies. |
+| start | `node artifacts/api-server/dist/index.mjs` (the image's `CMD`) | One process serves the API **and** the built frontend. |
 | health check | `/api/healthz` | Render restarts the service if it stops answering. |
 | `TRUST_PROXY` | `1` | Render terminates TLS in front of the app. |
 
@@ -74,10 +104,16 @@ Render. Don't: that storage does not survive a deploy.
 
 **Calls connect but there's no video on mobile data** — set `TURN_*`. See above.
 
+**`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`** — pnpm trying to purge
+`node_modules` with no TTY to confirm it. Already fixed in the `Dockerfile`
+(`ENV CI=true` plus `--config.confirmModulesPurge=false`). If you see it in your
+own scripts, that non-interactive knob is the fix.
+
 **Build fails on `better-sqlite3`** — it's only used in SQLite mode, but it is
-still installed. Render's build image has the toolchain, so this normally just
-works; if it ever doesn't, set `PNPM_CONFIG_IGNORE_SCRIPTS=true` (Postgres mode
-doesn't need the native binary).
+still installed, and the image carries `python3`/`make`/`g++` so it can compile
+when no prebuilt binary matches. If a build ever fails there anyway, set
+`PNPM_CONFIG_IGNORE_SCRIPTS=true` as a service env var — Postgres mode never
+loads the native binary.
 
 ## Verifying a deploy
 

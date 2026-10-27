@@ -111,8 +111,25 @@ journalctl -u videocall -f
 ## Option C — the loader (update with a restart click)
 
 If you would rather never touch git on the VPS again, use `loader/` from this
-repo. It pulls the source zip from GitHub itself, builds it, runs it and
-supervises it. Updating = restarting the loader.
+repo. It fetches the project, runs it and supervises it. Updating = restarting
+the loader.
+
+**On a small panel, use `DEPLOY_MODE=prebuilt`.** In that mode the loader
+downloads a published release (2 MB, ~230 files) instead of building: it
+creates ~230 files instead of ~43,000, needs no pnpm, no C toolchain and about
+130 MB of disk instead of ~1 GB.
+
+That matters because budget panel hosts force-stop containers that create too
+many files too quickly — the failure looks like a crash, not like a build
+problem. A source build there is what triggers it.
+
+* `DEPLOY_MODE=prebuilt` — the published release. **Use this on panels.**
+* `DEPLOY_MODE=source` — clone and build on the box (needs the disk and CPU).
+* `DEPLOY_MODE=auto` — default: prebuilt if a release exists, else source.
+
+Releases are produced by `scripts/build-release.mjs` (see *Publishing a
+release* below) and published as GitHub release assets, so `prebuilt` works out
+of the box for `v1.0.0`.
 
 ```
 /srv/videocall/
@@ -136,7 +153,8 @@ curl -fsSL https://raw.githubusercontent.com/favourite111/Let-s-chat-/main/loade
 
 npm install            # adm-zip + chalk, nothing else
 cp .env.example .env   # edit PORT / TURN / CORS_ORIGINS
-node index.js          # first run downloads, builds, and starts everything
+# on a small panel, add: DEPLOY_MODE=prebuilt
+node index.js          # first run fetches a release (or builds), and starts
 ```
 
 ### Deploy an update

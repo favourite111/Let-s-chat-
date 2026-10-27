@@ -1,31 +1,33 @@
 services:
   - type: web
     name: videocall
-    runtime: node
-    # Render's filesystem is ephemeral, so rooms are stored in Postgres rather
-    # than SQLite. The database below is created from this blueprint and its
-    # connection string is injected as DATABASE_URL automatically.
-    buildCommand: >-
-      corepack enable &&
-      pnpm install --frozen-lockfile &&
-      PORT=5173 BASE_PATH=/ pnpm --filter @workspace/video-call run build &&
-      pnpm --filter @workspace/api-server run build
-    startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
+    # Docker, not the native Node runtime. This is what Render was already
+    # doing (it found ./Dockerfile on its own), so being explicit means the
+    # Blueprint and the live service agree. To use Render's native runtime
+    # instead, change this to `runtime: node` and set:
+    #   buildCommand: corepack enable && pnpm install --frozen-lockfile &&
+    #     PORT=5173 BASE_PATH=/ pnpm --filter @workspace/video-call run build &&
+    #     pnpm --filter @workspace/api-server run build
+    #   startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /api/healthz
     # One instance: presence is in-process. Scale out only after adding
     # REDIS_URL, which attaches the Socket.IO Redis adapter automatically.
     envVars:
       - key: NODE_ENV
         value: production
-      - key: NODE_VERSION
-        value: "22"
-      - key: PORT
-        value: 8080
       - key: TRUST_PROXY
         value: 1
-      # Postgres is mandatory here — with STORE=postgres the server refuses to
-      # boot if the database is unreachable, instead of quietly falling back to
-      # a SQLite file that Render wipes on the next deploy.
+      # NOTE: PORT is deliberately absent. Render injects it (default 10000)
+      # and overrides the image's ENV. Pinning a different value here is the
+      # classic cause of "no open ports detected".
+      #
+      # Render's filesystem is ephemeral, so rooms go to Postgres, not SQLite.
+      # STORE=postgres makes the server refuse to boot if the database is
+      # unreachable instead of quietly writing to a file that Render wipes on
+      # the next deploy.
       - key: STORE
         value: postgres
       - key: DATABASE_URL
