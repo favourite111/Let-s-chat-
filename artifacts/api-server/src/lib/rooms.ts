@@ -175,6 +175,21 @@ export async function roomCount(): Promise<number> {
   return requireService().store.count();
 }
 
+/**
+ * The room backend actually in use: "postgres", "sqlite" or "memory".
+ *
+ * Exposed through /api/healthz because "the deploy is up" says nothing about
+ * where rooms are being written — on a host with an ephemeral disk that
+ * difference is the whole ballgame.
+ */
+export function roomStoreKind(): string | null {
+  try {
+    return requireService().store.kind;
+  } catch {
+    return null;
+  }
+}
+
 /** Delete rooms that are both empty and idle past the TTL. */
 export async function sweepExpired(ttlMs = DEFAULT_TTL_MS): Promise<number> {
   const { store, presence } = requireService();
