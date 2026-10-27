@@ -955,7 +955,7 @@ export default function Room() {
             <p style={{ color: "#fff", fontSize: "14px", fontWeight: 600, margin: 0, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
               Room {roomId?.slice(0, 8)}
             </p>
-            <p style={{ color: "rgba(255,255,255,0.4)", fontSize: "11px", margin: 0, display: "flex", alignItems: "center", gap: "4px" }}>
+            <p style={{ color: "rgba(255,255,255,0.4)", fontSize: "11px", margin: 0, display: "flex", alignItems: "center", gap: "4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
               <ShieldCheck style={{ width: "10px", height: "10px" }} aria-hidden="true" />
               Encrypted in transit · {formatDuration(callSeconds)}
             </p>
@@ -1005,7 +1005,7 @@ export default function Room() {
             style={{ display: "flex", alignItems: "center", gap: "4px", background: "rgba(255,255,255,0.1)", border: "none", borderRadius: "20px", padding: "6px 12px", fontSize: "12px", color: "rgba(255,255,255,0.7)", cursor: "pointer" }}
           >
             <Copy style={{ width: "12px", height: "12px" }} aria-hidden="true" />
-            Copy Link
+            <span className="copy-link-label">Copy Link</span>
           </button>
         </div>
       </div>
@@ -1204,13 +1204,40 @@ export default function Room() {
       </div>
 
       {/* Control Bar */}
-      <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, zIndex: 30, padding: "16px 24px 32px", background: "linear-gradient(0deg, rgba(0,0,0,0.8) 0%, transparent 100%)", display: "flex", justifyContent: "center" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+      <div
+        className="call-controls-bar"
+        style={{
+          position: "absolute",
+          bottom: 0,
+          left: 0,
+          right: 0,
+          zIndex: 30,
+          padding: "16px 12px calc(22px + env(safe-area-inset-bottom, 0px))",
+          background: "linear-gradient(0deg, rgba(0,0,0,0.85) 0%, transparent 100%)",
+          display: "flex",
+          justifyContent: "center",
+        }}
+      >
+        <div
+          className="call-controls"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            // The host adds two more controls. On a phone that does not fit on
+            // one line, so the bar wraps instead of pushing buttons off-screen.
+            flexWrap: "wrap",
+            gap: "10px 12px",
+            width: "100%",
+            maxWidth: "520px",
+          }}
+        >
+          <div className="call-controls-group" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           <button
             onClick={toggleMute}
             aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
             aria-pressed={isMuted}
-            style={{ width: "52px", height: "52px", borderRadius: "50%", border: "none", background: isMuted ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)", color: isMuted ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", backdropFilter: "blur(12px)" }}
+            style={{ width: "52px", height: "52px", flex: "0 0 auto", borderRadius: "50%", border: "none", background: isMuted ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)", color: isMuted ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", backdropFilter: "blur(12px)" }}
           >
             {isMuted ? <MicOff className="w-5 h-5" aria-hidden="true" /> : <Mic className="w-5 h-5" aria-hidden="true" />}
           </button>
@@ -1220,7 +1247,7 @@ export default function Room() {
             disabled={audioOnlyMode}
             aria-label={isVideoOff ? "Turn camera on" : "Turn camera off"}
             aria-pressed={isVideoOff}
-            style={{ width: "52px", height: "52px", borderRadius: "50%", border: "none", background: isVideoOff ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)", color: isVideoOff ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: audioOnlyMode ? "not-allowed" : "pointer", opacity: audioOnlyMode ? 0.4 : 1, backdropFilter: "blur(12px)" }}
+            style={{ width: "52px", height: "52px", flex: "0 0 auto", borderRadius: "50%", border: "none", background: isVideoOff ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)", color: isVideoOff ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: audioOnlyMode ? "not-allowed" : "pointer", opacity: audioOnlyMode ? 0.4 : 1, backdropFilter: "blur(12px)" }}
           >
             {isVideoOff || audioOnlyMode ? <VideoOff className="w-5 h-5" aria-hidden="true" /> : <VideoIcon className="w-5 h-5" aria-hidden="true" />}
           </button>
@@ -1228,20 +1255,22 @@ export default function Room() {
           <button
             onClick={leaveCall}
             aria-label="Leave call"
-            style={{ height: "52px", borderRadius: "26px", border: "none", background: "linear-gradient(135deg, #ef4444, #dc2626)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 24px", cursor: "pointer", fontWeight: 600, fontSize: "14px", boxShadow: "0 4px 20px rgba(239,68,68,0.4)" }}
+            style={{ height: "52px", borderRadius: "26px", border: "none", background: "linear-gradient(135deg, #ef4444, #dc2626)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 22px", cursor: "pointer", fontWeight: 600, fontSize: "14px", whiteSpace: "nowrap", flex: "0 0 auto", boxShadow: "0 4px 20px rgba(239,68,68,0.4)" }}
           >
             <PhoneOff className="w-5 h-5" aria-hidden="true" />
-            Leave
+            <span className="control-label">Leave</span>
           </button>
+          </div>
 
+          <div className="call-controls-group" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           {isHost && remotePeer && (
             <button
               onClick={() => removeParticipant(remotePeer.participantId)}
               aria-label="Remove participant from this room"
-              style={{ height: "52px", borderRadius: "26px", border: "1px solid rgba(245,158,11,0.4)", background: "rgba(245,158,11,0.15)", color: "#fbbf24", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 20px", cursor: "pointer", fontWeight: 600, fontSize: "14px" }}
+              style={{ height: "52px", borderRadius: "26px", border: "1px solid rgba(245,158,11,0.4)", background: "rgba(245,158,11,0.15)", color: "#fbbf24", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 18px", cursor: "pointer", fontWeight: 600, fontSize: "14px", whiteSpace: "nowrap", flex: "0 0 auto" }}
             >
               <UserX className="w-5 h-5" aria-hidden="true" />
-              Remove
+              <span className="control-label">Remove</span>
             </button>
           )}
 
@@ -1249,16 +1278,26 @@ export default function Room() {
             <button
               onClick={endCallForEveryone}
               aria-label="End the call for everyone and close the room"
-              style={{ height: "52px", borderRadius: "26px", border: "none", background: "rgba(239,68,68,0.2)", color: "#fca5a5", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 20px", cursor: "pointer", fontWeight: 600, fontSize: "14px" }}
+              style={{ height: "52px", borderRadius: "26px", border: "none", background: "rgba(239,68,68,0.2)", color: "#fca5a5", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 18px", cursor: "pointer", fontWeight: 600, fontSize: "14px", whiteSpace: "nowrap", flex: "0 0 auto" }}
             >
               <PhoneOff className="w-5 h-5" aria-hidden="true" />
-              End for all
+              <span className="control-label">End for all</span>
             </button>
           )}
+          </div>
         </div>
       </div>
 
       <style>{`
+        /* Phone widths: tighten the spacing first, and drop the wording on the
+           host's two secondary actions before anything is allowed to overflow. */
+        @media (max-width: 430px) {
+          .call-controls { gap: 8px !important; }
+          /* The room name matters more than the words on this button. */
+          .copy-link-label { display: none; }
+          .call-controls-group { gap: 8px !important; }
+          .call-controls-bar { padding-left: 8px !important; padding-right: 8px !important; }
+        }
         @keyframes spin {
           from { transform: rotate(0deg); }
           to { transform: rotate(360deg); }
