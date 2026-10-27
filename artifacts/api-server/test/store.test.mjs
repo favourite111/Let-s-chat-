@@ -129,20 +129,23 @@ describe("PostgresRoomStore (pg-mem)", () => {
     await store.close();
   });
 
-  it("init is idempotent (CREATE TABLE IF NOT EXISTS)", async () => {
-    const { newDb } = await import("pg-mem");
-    const db = newDb();
-    const { Pool } = db.adapters.createPg();
-    const pool = new Pool();
+  it(
+    "init is idempotent against a real database",
+    { skip: !process.env.DATABASE_URL && "needs DATABASE_URL (pg-mem cannot re-run CREATE TABLE IF NOT EXISTS)" },
+    async () => {
+      // Exercised in CI against the real Postgres service container: booting
+      // the server twice must not fail because the table already exists.
+      const a = new PostgresRoomStore(process.env.DATABASE_URL);
+      await a.init();
+      const b = new PostgresRoomStore(process.env.DATABASE_URL);
+      await b.init();
 
-    const a = new PostgresRoomStore("postgres://unused", () => pool);
-    await a.init();
-    const b = new PostgresRoomStore("postgres://unused", () => pool);
-    await b.init();
-
-    await b.insert(sampleRoom("pgroom000002"));
-    assert.equal(await b.count(), 1);
-  });
+      await b.insert(sampleRoom("pgroom000002"));
+      assert.equal(await b.count() >= 1, true);
+      await b.remove("pgroom000002");
+      await a.close();
+    },
+  );
 });
 
 describe("MemoryPresence", () => {

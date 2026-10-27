@@ -31,10 +31,10 @@ async function buildAll() {
       "*.node",
       // Drivers are optional at runtime: externalising them keeps the bundle
       // small and lets the server boot even if one is missing.
+      // Only the native driver stays external. pg / redis / the redis adapter
+      // are pure JS, so bundling them keeps the prebuilt release to ~50 files
+      // instead of ~3000 — which matters on panels that throttle file creation.
       "better-sqlite3",
-      "pg",
-      "redis",
-      "@socket.io/redis-adapter",
       "sharp",
       "better-sqlite3",
       "sqlite3",

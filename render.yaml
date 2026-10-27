@@ -2,36 +2,42 @@ services:
   - type: web
     name: videocall
     runtime: node
-    # The build used to omit PORT, which made `vite build` throw before it ever
-    # produced a bundle. Values below are the minimum needed for the build.
+    # Render's filesystem is ephemeral, so rooms are stored in Postgres rather
+    # than SQLite. The database below is created from this blueprint and its
+    # connection string is injected as DATABASE_URL automatically.
     buildCommand: >-
+      corepack enable &&
       pnpm install --frozen-lockfile &&
       PORT=5173 BASE_PATH=/ pnpm --filter @workspace/video-call run build &&
       pnpm --filter @workspace/api-server run build
     startCommand: node --enable-source-maps artifacts/api-server/dist/index.mjs
     healthCheckPath: /api/healthz
-    # Rooms live in memory, so a single instance is required until the store is
-    # moved to Postgres/Redis (see docs/ARCHITECTURE.md).
-    numInstances: 1
+    # One instance: presence is in-process. Scale out only after adding
+    # REDIS_URL, which attaches the Socket.IO Redis adapter automatically.
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: "22"
       - key: PORT
         value: 8080
       - key: TRUST_PROXY
         value: 1
-      # Set this to your public URL(s) to lock CORS down, e.g.
-      # https://videocall.onrender.com
-      - key: CORS_ORIGINS
-        sync: false
-      # Render web services have an ephemeral filesystem, so SQLite would be
-      # wiped on every deploy. Attach a Render Postgres and set DATABASE_URL
-      # (or add a persistent disk and keep SQLITE_PATH inside it).
+      # Postgres is mandatory here — with STORE=postgres the server refuses to
+      # boot if the database is unreachable, instead of quietly falling back to
+      # a SQLite file that Render wipes on the next deploy.
+      - key: STORE
+        value: postgres
       - key: DATABASE_URL
         fromDatabase:
           name: videocall-db
           property: connectionString
-      # Bring your own TURN relay (coturn/metered) for mobile networks.
+      # Set this to your Render URL once you know it, e.g.
+      # https://videocall.onrender.com
+      - key: CORS_ORIGINS
+        sync: false
+      # TURN relay — strongly recommended for mobile networks. Set these in the
+      # dashboard (they are secrets):
       - key: TURN_URLS
         sync: false
       - key: TURN_USERNAME

@@ -1,0 +1,13 @@
+{
+  "name": "videocall",
+  "commit": "b59618980ab8bb01cf338102691471ddc901cdae",
+  "commitShort": "b5961898",
+  "builtAt": "2026-10-26T23:48:39.764Z",
+  "node": "v20.20.2",
+  "files": 230,
+  "bytes": 8485195,
+  "startFile": "artifacts/api-server/dist/index.mjs",
+  "runtimeDeps": [
+    "better-sqlite3"
+  ]
+}

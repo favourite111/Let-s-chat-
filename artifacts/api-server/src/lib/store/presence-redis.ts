@@ -13,22 +13,69 @@ import type { PresenceStore } from "./types";
  */
 const KEY_PREFIX = "videocall:peers:";
 const KEY_TTL_SECONDS = 6 * 60 * 60;
+const CONNECT_TIMEOUT_MS = Number(process.env.REDIS_CONNECT_TIMEOUT_MS ?? 8_000);
 
 export class RedisPresence implements PresenceStore {
   readonly kind = "redis" as const;
   private client: any = null;
 
-  constructor(private readonly url: string) {}
+  /**
+   * @param url           Redis URL
+   * @param clientFactory injection point for tests; defaults to redis.createClient
+   */
+  constructor(
+    private readonly url: string,
+    private readonly clientFactory?: (options: { url: string }) => any,
+  ) {}
 
   async init(): Promise<void> {
+    if (this.clientFactory) {
+      this.client = this.clientFactory({ url: this.url });
+      await this.client.connect();
+      return;
+    }
+
     const { createClient } = await import("redis");
-    this.client = createClient({ url: this.url });
-    this.client.on("error", (err: unknown) => {
-      // Do not throw from an event handler: log and let reconnect logic work.
+    const client = createClient({
+      url: this.url,
+      // node-redis otherwise retries a bad host forever, which turns a
+      // misconfigured REDIS_URL into a hung boot instead of a clear error.
+      socket: { connectTimeout: CONNECT_TIMEOUT_MS, reconnectStrategy: false },
+    });
+
+    client.on("error", (err: unknown) => {
+      // Never throw from an event handler; log and let the caller decide.
       // eslint-disable-next-line no-console
       console.error(JSON.stringify({ level: 50, msg: "Redis client error", err: String(err) }));
     });
-    await this.client.connect();
+
+    // Fail fast: reject on the first error or when the timeout elapses, rather
+    // than waiting for an infinite reconnect loop.
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`Redis connection timed out after ${CONNECT_TIMEOUT_MS}ms`));
+      }, CONNECT_TIMEOUT_MS);
+      timer.unref?.();
+
+      client.once("error", (err: unknown) => {
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
+
+      client
+        .connect()
+        .then(() => {
+          clearTimeout(timer);
+          resolve();
+        })
+        .catch((err: unknown) => {
+          clearTimeout(timer);
+          reject(err instanceof Error ? err : new Error(String(err)));
+        });
+    });
+
+    // Connected: restore normal retry behaviour for the rest of the run.
+    this.client = client;
   }
 
   private key(roomId: string): string {

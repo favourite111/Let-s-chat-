@@ -1,0 +1,10 @@
+{
+  "name": "videocall-release",
+  "private": true,
+  "version": "0.0.0-b5961898",
+  "type": "module",
+  "description": "Prebuilt VideoCall server + frontend",
+  "dependencies": {
+    "better-sqlite3": "^11.10.0"
+  }
+}

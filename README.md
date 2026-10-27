@@ -59,6 +59,10 @@ node index.js --check     # what would change?
 node index.js             # update if needed, then run
 ```
 
+**Render:** click **New → Blueprint**, pick this repo, apply. `render.yaml` creates
+the web service *and* a Postgres database and wires them together — see
+[`docs/DEPLOY-RENDER.md`](docs/DEPLOY-RENDER.md).
+
 Step-by-step for Docker, bare Node + systemd, and the loader — plus nginx + HTTPS
 + coturn: **[`docs/DEPLOY-VPS.md`](docs/DEPLOY-VPS.md)**.
 
@@ -69,7 +73,7 @@ Three backends, one interface; the app picks one at boot.
 | Backend | When it is used | Durable? | Needed for |
 |---|---|---|---|
 | **SQLite** (default) | always, unless told otherwise | ✅ file on disk | a single VPS — recommended |
-| **Postgres** | when `DATABASE_URL` is set (or `STORE=postgres`) | ✅ | hosts with no persistent disk (Render, Railway, Fly), or >1 instance |
+| **Postgres** | when `DATABASE_URL` is set (or `STORE=postgres`) | ✅ | hosts with no persistent disk (Render, Railway, Fly) — **Render uses this**, or >1 instance |
 | **memory** | `STORE=memory`, or if SQLite is unavailable at the default path | ❌ | tests |
 
 **Presence** (who is currently in a room) is separate from rooms and lives in memory by default, or in **Redis** when `REDIS_URL` is set — that plus the Socket.IO Redis adapter is what lets you run several instances. A single VPS never needs it.
