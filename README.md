@@ -50,9 +50,15 @@ One process serves the SPA and the API. Rooms are written to **`./data/videocall
 docker compose up -d --build      # app + ./data volume, nothing else needed
 ```
 
-Or use the zero-touch loader in [`loader/`](loader/): it pulls the source zip from
-GitHub, builds it, runs and supervises it, and keeps your database — so shipping
-an update is just **restart**.
+Or use the zero-touch loader in [`loader/`](loader/): it fetches a release, runs
+and supervises it, and keeps your database — so shipping an update is just
+**restart**.
+
+On a small panel (the kind that force-stops a container for creating too many
+files), set **`DEPLOY_MODE=prebuilt`**. The loader then downloads the published
+release — 2 MB, ~230 files — instead of installing and building, which writes
+~43,000 files and is what trips those limits. Nothing to install, no compiler,
+about 130 MB of disk. Without it, `auto` builds from source.
 
 ```bash
 node index.js --check     # what would change?

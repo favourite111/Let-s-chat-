@@ -53,3 +53,6 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# Prebuilt release output — published as GitHub release assets, not committed.
+.release/
