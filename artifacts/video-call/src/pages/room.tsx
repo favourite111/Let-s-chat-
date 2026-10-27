@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import {
   forgetLegacyParticipantId,
+  getHostParticipantId,
   getHostSecret,
   getParticipantId,
   resolveJoinIdentity,
@@ -201,7 +202,14 @@ export default function Room() {
      *    the host's own seat.
      */
     let participantId = getParticipantId();
+    // What we send on join: null when this tab is joining as an ordinary guest.
     let hostSecret = getHostSecret(roomId);
+    // What this browser holds, regardless of how this tab joined. Kept so a tab
+    // that joined as a guest can take the host seat once it is free.
+    const storedSecret = getHostSecret(roomId);
+
+    // Built fresh each time: a later reclaim switches the identity used here.
+    const joinPayload = () => ({ roomId, participantId, hostSecret, displayName: null });
 
     const resolveIdentity = async () => {
       try {
@@ -343,6 +351,72 @@ export default function Room() {
       setHasRemoteVideo(false);
     };
 
+    /**
+     * A tab of the host's own browser that joined as a guest (because the host
+     * was still in the call elsewhere) keeps watching the room. When the host's
+     * seat has been free for a while — the other window was closed — this tab
+     * takes it back, so the room never becomes uncontrollable just because a
+     * window was closed.
+     *
+     * "For a while" matters: a host who is merely reconnecting has a free seat
+     * for a moment, and there is no point in two windows fighting over it.
+     */
+    let reclaimTimer: number | null = null;
+    let freeObservations = 0;
+    let claimingHost = false;
+
+    const stopReclaimWatch = () => {
+      if (reclaimTimer !== null) {
+        window.clearInterval(reclaimTimer);
+        reclaimTimer = null;
+      }
+      freeObservations = 0;
+    };
+
+    const startReclaimWatch = (socket: Socket) => {
+      if (!storedSecret || reclaimTimer !== null) return;
+      const storedHostId = getHostParticipantId(roomId);
+      // No stored host id means this tab either is the host or never created
+      // the room; there is no seat to reclaim.
+      if (!storedHostId || storedHostId === participantId) return;
+
+      reclaimTimer = window.setInterval(() => {
+        if (cancelled || terminal || claimingHost) {
+          stopReclaimWatch();
+          return;
+        }
+
+        void fetch(`/api/rooms/${roomId}`)
+          .then((res) => (res.ok ? res.json() : null))
+          .then((room: { closed?: boolean; hostConnected?: boolean } | null) => {
+            if (!room || room.closed) {
+              stopReclaimWatch();
+              return;
+            }
+            if (room.hostConnected) {
+              freeObservations = 0;
+              return;
+            }
+            freeObservations += 1;
+            if (freeObservations < 3) return;
+
+            // Three consecutive checks with nobody in the host seat: take it.
+            stopReclaimWatch();
+            participantId = storedHostId;
+            hostSecret = storedSecret;
+            socket.emit("leave");
+            window.setTimeout(() => {
+              if (!cancelled && !terminal && socket.connected) {
+                socket.emit("join-room", joinPayload());
+              }
+            }, 100);
+          })
+          .catch(() => {
+            /* transient network error: try again next tick */
+          });
+      }, 4000);
+    };
+
     const start = async () => {
       // 0. Who is this tab in this room? Decided before the camera is touched,
       //    so a closed room never turns it on.
@@ -392,8 +466,6 @@ export default function Room() {
       const socket = io({ path: "/socket.io", transports: ["websocket", "polling"] });
       socketRef.current = socket;
 
-      const joinPayload = { roomId, participantId, hostSecret, displayName: null };
-
       socket.on("connect", () => {
         if (terminal) return;
         setStatus("connecting");
@@ -406,7 +478,7 @@ export default function Room() {
           pcRef.current.close();
           pcRef.current = null;
         }
-        socket.emit("join-room", joinPayload);
+        socket.emit("join-room", joinPayload());
       });
 
       socket.on("disconnect", () => {
@@ -423,7 +495,9 @@ export default function Room() {
           isHost?: boolean;
           reclaimed?: boolean;
         }) => {
+          claimingHost = Boolean(hostFlag);
           setIsHost(Boolean(hostFlag));
+          if (claimingHost) stopReclaimWatch();
           setRoster(participants ?? []);
           setJoinAttempt(0);
 
@@ -437,6 +511,7 @@ export default function Room() {
             setStatus("waiting");
           }
           emitMediaState();
+          if (!claimingHost) startReclaimWatch(socket);
         },
       );
 
@@ -478,7 +553,7 @@ export default function Room() {
           if (cancelled) return;
           setJoinAttempt((n) => n + 1);
           if (socketRef.current?.connected) {
-            socketRef.current.emit("join-room", joinPayload);
+            socketRef.current.emit("join-room", joinPayload());
           }
         }, 5000);
       });
@@ -612,6 +687,7 @@ export default function Room() {
 
     return () => {
       cancelled = true;
+      stopReclaimWatch();
       if (retryTimer !== null) window.clearTimeout(retryTimer);
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
