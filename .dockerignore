@@ -1,0 +1,33 @@
+# Never send these into the build context. Without this file `COPY . .` would
+# drag a local node_modules (wrong platform binaries) and build output into the
+# image, which is both slow and a way to get very confusing failures.
+
+node_modules
+**/node_modules
+**/dist
+.release
+.cache
+data
+*.db
+*.db-wal
+*.db-shm
+
+.git
+.gitignore
+.github
+
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store
+Thumbs.db
+
+# Editor / tooling noise
+.vscode
+.idea
+*.tsbuildinfo
+
+# Attached screenshots from the Replit agent
+attached_assets

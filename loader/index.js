@@ -123,9 +123,36 @@ function loadEnvFile(file) {
 
 loadEnvFile(path.join(ROOT, ".env"));
 
+/** Where the project comes from. Read once, before CONFIG or REPO exist. */
+const REPO_INPUT = process.env.REPO_URL || "https://github.com/favourite111/Let-s-chat-";
+
+// ─── repo URL parsing ───────────────────────────────────────────────────────
+function parseRepo(url) {
+  const cleaned = url
+    .trim()
+    .replace(/\.git$/, "")
+    .replace(/\/$/, "")
+    .replace(/\/archive\/refs\/heads\/.*$/, "");
+
+  const patterns = [
+    /github\.com[/:]([^/]+)\/([^/]+)$/i,
+    /^([^/\s]+)\/([^/\s]+)$/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = cleaned.match(pattern);
+    if (match) return { owner: match[1], repo: match[2] };
+  }
+  throw new Error(
+    `Cannot understand REPO_URL "${url}". Use https://github.com/owner/repo or owner/repo.`,
+  );
+}
+
+const REPO = parseRepo(REPO_INPUT);
+
 // ─── config ─────────────────────────────────────────────────────────────────
 const CONFIG = {
-  repoUrl: process.env.REPO_URL || "https://github.com/favourite111/Let-s-chat-",
+  repoUrl: REPO_INPUT,
   branch: process.env.BRANCH || "main",
   githubToken: process.env.GITHUB_TOKEN || "",
   port: Number(process.env.PORT || 8080),
@@ -136,6 +163,19 @@ const CONFIG = {
   restartDelayMs: Number(process.env.RESTART_DELAY_MS || 3000),
   maxRestarts: Number(process.env.MAX_RESTARTS || 5),
   restartWindowMs: Number(process.env.RESTART_WINDOW_MS || 60_000),
+  // "auto"   → use the prebuilt release zip when one is published, else build
+  // "prebuilt"→ only ever download the release (recommended on small panels:
+  //             no pnpm, no build, ~1.5k files instead of ~100k)
+  // "source" → always download the repo and build it on this machine
+  mode: (process.env.DEPLOY_MODE || "auto").toLowerCase(),
+  releaseUrl:
+    process.env.RELEASE_URL ||
+    `https://github.com/${REPO.owner}/${REPO.repo}/releases/latest/download/release.zip`,
+  releaseMetaUrl:
+    process.env.RELEASE_META_URL ||
+    `https://github.com/${REPO.owner}/${REPO.repo}/releases/latest/download/release.json`,
+  // Server entry point inside app/ (updated in place by every release).
+  startFile: process.env.START_FILE || "artifacts/api-server/dist/index.mjs",
   // Keeping the previous release costs disk (node_modules) but enables
   // instant rollback. Set to 0 on a very small VPS.
   keepPrevious: (process.env.KEEP_PREVIOUS ?? "1") !== "0",
@@ -144,8 +184,6 @@ const CONFIG = {
   // the built-in pnpm steps below.
   installCmd: process.env.INSTALL_CMD || "",
   buildCmd: process.env.BUILD_CMD || "",
-  startFile:
-    process.env.START_FILE || "artifacts/api-server/dist/index.mjs",
 };
 
 // ─── small helpers ──────────────────────────────────────────────────────────
@@ -256,29 +294,7 @@ function probe(commandCandidates, args = ["--version"]) {
   return null;
 }
 
-// ─── repo URL parsing ───────────────────────────────────────────────────────
-function parseRepo(url) {
-  const cleaned = url
-    .trim()
-    .replace(/\.git$/, "")
-    .replace(/\/$/, "")
-    .replace(/\/archive\/refs\/heads\/.*$/, "");
 
-  const patterns = [
-    /github\.com[/:]([^/]+)\/([^/]+)$/i,
-    /^([^/\s]+)\/([^/\s]+)$/,
-  ];
-
-  for (const pattern of patterns) {
-    const match = cleaned.match(pattern);
-    if (match) return { owner: match[1], repo: match[2] };
-  }
-  throw new Error(
-    `Cannot understand REPO_URL "${url}". Use https://github.com/owner/repo or owner/repo.`,
-  );
-}
-
-const REPO = parseRepo(CONFIG.repoUrl);
 
 function authHeaders() {
   const headers = {
@@ -406,6 +422,98 @@ async function restoreInto(staging) {
     say.ok(`Restored "${name}" into the new release`);
   }
   await rmrf(preserveRoot);
+}
+
+// ─── prebuilt release ───────────────────────────────────────────────────────
+const RELEASE_ZIP = path.join(CACHE_DIR, "release.zip");
+
+/** Small JSON describing the published build (commit, builtAt, files). */
+async function fetchReleaseMeta() {
+  try {
+    const res = await fetch(CONFIG.releaseMetaUrl, {
+      headers: { "user-agent": "videocall-loader" },
+      redirect: "follow",
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+async function downloadRelease(destination) {
+  say.step(`Downloading prebuilt release from ${chalk.underline(CONFIG.releaseUrl)}`);
+
+  const res = await fetch(CONFIG.releaseUrl, {
+    headers: CONFIG.githubToken ? authHeaders() : { "user-agent": "videocall-loader" },
+    redirect: "follow",
+    signal: AbortSignal.timeout(180_000),
+  });
+
+  if (!res.ok) {
+    throw new Error(
+      `Release download failed: HTTP ${res.status} ${res.statusText}` +
+        (res.status === 404
+          ? " — no release.zip asset has been published yet. Publish one with `node scripts/build-release.mjs`, or set DEPLOY_MODE=source."
+          : ""),
+    );
+  }
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  if (buffer.length < 1024) throw new Error("Downloaded release is suspiciously small.");
+  await fsp.writeFile(destination, buffer);
+  say.ok(`Downloaded ${humanBytes(buffer.length)}`);
+  return buffer.length;
+}
+
+/** Extract a release zip: fewer, larger files — no burst-limiter trigger. */
+async function extractRelease(targetDir) {
+  say.step(`Extracting release into ${path.relative(ROOT, targetDir)}`);
+  const zip = new AdmZip(RELEASE_ZIP);
+  zip.extractAllTo(targetDir, true);
+
+  const manifestFile = path.join(targetDir, "MANIFEST.json");
+  const manifest = readJson(manifestFile, null);
+  if (!manifest || !exists(path.join(targetDir, manifest.startFile || CONFIG.startFile))) {
+    throw new Error("Release archive does not contain a runnable server bundle.");
+  }
+  say.ok(`Release ${manifest.commitShort || "?"} · ${manifest.files || "?"} files`);
+  return manifest;
+}
+
+/** Prebuilt pipeline: no install, no build. */
+async function installPrebuilt(releaseMeta) {
+  say.step("Preparing staging directory");
+  await rmrf(STAGING_DIR);
+  await ensureDir(STAGING_DIR);
+  await rmrf(path.join(CACHE_DIR, "preserve"));
+
+  await preserveFromApp();
+  await extractRelease(STAGING_DIR);
+  await restoreInto(STAGING_DIR);
+
+  await activate();
+  writeJson(STATE_FILE, {
+    mode: "prebuilt",
+    sha: releaseMeta?.commit || "unknown",
+    branch: CONFIG.branch,
+    repo: `${REPO.owner}/${REPO.repo}`,
+    deployedAt: new Date().toISOString(),
+  });
+  say.ok(
+    `Deployed prebuilt ${releaseMeta?.commitShort || ""} from ${REPO.owner}/${REPO.repo}`.trim(),
+  );
+  return { updated: true, sha: releaseMeta?.commit || null };
+}
+
+/** Is a prebuilt release usable for this deployment? */
+async function prebuiltAvailable() {
+  if (CONFIG.mode === "source") return false;
+  const meta = await fetchReleaseMeta();
+  if (meta) return meta;
+  // No release.json: fall back to the source build unless the user insisted.
+  return CONFIG.mode === "prebuilt" ? false : null;
 }
 
 // ─── toolchain ──────────────────────────────────────────────────────────────
@@ -552,21 +660,59 @@ async function updateIfNeeded({ force = false } = {}) {
 
   if (CONFIG.forceRebuild || force) say.warn("Forced rebuild requested");
 
+  // ── prebuilt path: what a small panel should use ─────────────────────────
+  const releaseMeta = await prebuiltAvailable();
+
+  if (releaseMeta) {
+    const sameRelease =
+      state.mode === "prebuilt" &&
+      state.sha &&
+      releaseMeta.commit &&
+      state.sha === releaseMeta.commit;
+
+    if (!CONFIG.forceRebuild && !force && installed && sameRelease) {
+      say.ok(`Already on the latest prebuilt release (${releaseMeta.commitShort}).`);
+      if (state.deployedAt) say.info(`Deployed ${state.deployedAt}`);
+      return { updated: false, sha: state.sha };
+    }
+
+    rule("Updating (prebuilt release)");
+    say.info(`Mode      prebuilt · ${releaseMeta.files || "?"} files, no build needed`);
+
+    try {
+      await downloadRelease(RELEASE_ZIP);
+      return await installPrebuilt(releaseMeta);
+    } catch (err) {
+      say.err(`Prebuilt update failed: ${err.message}`);
+      await rmrf(STAGING_DIR);
+      if (installed) {
+        say.warn("Keeping the currently installed release untouched.");
+        return { updated: false, sha: state.sha, failed: true };
+      }
+      if (CONFIG.mode === "prebuilt") throw err;
+      say.warn("Falling back to a source build.");
+    }
+  } else if (CONFIG.mode === "prebuilt") {
+    throw new Error(
+      "DEPLOY_MODE=prebuilt but no release.json could be fetched. " +
+        "Publish a release (node scripts/build-release.mjs + upload), or use DEPLOY_MODE=source.",
+    );
+  }
+
+  // ── source path: clone the repo zip and build it here ────────────────────
   const remoteSha = await resolveRemoteSha();
   const sameCommit = Boolean(remoteSha && state.sha && remoteSha === state.sha);
 
   if (CONFIG.forceRebuild || force || !installed || !sameCommit) {
     if (!installed) {
       say.info("No installed release found — performing a first-time install.");
-    } else if (!CONFIG.forceRebuild && !force && sameCommit && !installed) {
-      say.info("Install incomplete — rebuilding.");
     } else if (remoteSha && state.sha && remoteSha !== state.sha) {
       say.info(
         `New commit on ${CONFIG.branch}: ${chalk.gray(state.sha.slice(0, 8))} → ${chalk.greenBright(remoteSha.slice(0, 8))}`,
       );
     }
 
-    rule("Updating");
+    rule("Updating (source build)");
     preflight();
     resolvePnpm();
     await downloadZip(ZIP_FILE);
@@ -575,6 +721,7 @@ async function updateIfNeeded({ force = false } = {}) {
       await stagedInstall();
       await activate();
       writeJson(STATE_FILE, {
+        mode: "source",
         sha: remoteSha || "unknown",
         branch: CONFIG.branch,
         repo: `${REPO.owner}/${REPO.repo}`,
@@ -810,7 +957,9 @@ async function main() {
     const remoteSha = await resolveRemoteSha();
     const installed = exists(path.join(APP_DIR, CONFIG.startFile));
     console.log("");
-    say.info(`Installed : ${state.sha ? state.sha.slice(0, 8) : "none"}${state.deployedAt ? ` (${state.deployedAt})` : ""}`);
+    const releaseMeta = await fetchReleaseMeta();
+    say.info(`Mode      : ${CONFIG.mode}${releaseMeta ? ` (prebuilt ${releaseMeta.commitShort} available)` : " (no prebuilt release found)"}`);
+    say.info(`Installed : ${state.sha ? state.sha.slice(0, 8) : "none"}${state.mode ? ` · ${state.mode}` : ""}${state.deployedAt ? ` (${state.deployedAt})` : ""}`);
     say.info(`Remote    : ${remoteSha ? remoteSha.slice(0, 8) : "unknown"}`);
     say.info(`Ready     : ${installed ? "yes" : "no"}`);
     say.info(
