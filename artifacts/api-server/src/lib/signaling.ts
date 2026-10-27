@@ -269,7 +269,11 @@ export function setupSignaling(io: SocketIOServer) {
         // peer's old connection to this person is dead, so it must renegotiate.
         for (const other of result.others) {
           if (!other.socketId) continue;
-          io.to(other.socketId).emit("user-connected", { participantId });
+          io.to(other.socketId).emit("user-connected", {
+            participantId,
+            displayName: result.participant.displayName,
+            role: result.participant.role,
+          });
         }
 
         await broadcastRoster(roomId);

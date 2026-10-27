@@ -238,18 +238,20 @@ describe("Signaling", () => {
     assert.equal((await receipt2).reason, "invalid-participant");
   });
 
-  it("refuses a third participant", async () => {
+  it("fills the room to four and refuses the fifth", async () => {
     const { room } = await createOwnedRoom();
-    const a = connect();
-    const b = connect();
-    const c = connect();
-    await Promise.all([once(a, "connect"), once(b, "connect"), once(c, "connect")]);
+    const sockets = [connect(), connect(), connect(), connect(), connect()];
+    await Promise.all(sockets.map((socket) => once(socket, "connect")));
 
-    await joinRoom(a, room.id, newParticipantId("a"));
-    await joinRoom(b, room.id, newParticipantId("b"));
+    for (const socket of sockets.slice(0, 4)) {
+      await joinRoom(socket, room.id, newParticipantId("p"));
+    }
 
-    const full = once(c, "room-full");
-    c.emit("join-room", { roomId: room.id, participantId: newParticipantId("c") });
+    const detail = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(detail.participantCount, 4);
+
+    const full = once(sockets[4], "room-full");
+    sockets[4].emit("join-room", { roomId: room.id, participantId: newParticipantId("p") });
     await full;
   });
 
@@ -278,13 +280,20 @@ describe("Signaling", () => {
     const res = await fetch(`${BASE}/api/rooms/${room.id}`);
     assert.equal((await res.json()).participantCount, 2, "still two people");
 
-    // And a genuinely new person is still refused: the room is full of humans,
-    // not of ghosts of the person who just reloaded.
-    const c = connect();
-    await once(c, "connect");
-    const full = once(c, "room-full");
-    c.emit("join-room", { roomId: room.id, participantId: newParticipantId("c") });
+    // The room is full of humans, not ghosts: with two more real people in it
+    // (four total) the next join is refused — and that refusal is about
+    // capacity, not about the reload.
+    const extras = [connect(), connect(), connect()];
+    await Promise.all(extras.map((socket) => once(socket, "connect")));
+    for (const socket of extras.slice(0, 2)) {
+      await joinRoom(socket, room.id, newParticipantId("extra"));
+    }
+    const full = once(extras[2], "room-full");
+    extras[2].emit("join-room", { roomId: room.id, participantId: newParticipantId("late") });
     await full;
+
+    const after = await (await fetch(`${BASE}/api/rooms/${room.id}`)).json();
+    assert.equal(after.participantCount, 4, "still four people, not five");
   });
 
   it("tells a superseded tab it is no longer in the call", async () => {

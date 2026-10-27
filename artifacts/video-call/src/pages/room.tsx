@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useLocation } from "wouter";
 import { io, type Socket } from "socket.io-client";
 import { Button } from "@/components/ui/button";
@@ -60,10 +60,30 @@ interface RosterEntry {
   connected: boolean;
 }
 
+/**
+ * One peer connection per other person.
+ *
+ * A group call is a mesh: with four people each browser keeps three peer
+ * connections, one per peer, and every media track goes directly to each of
+ * them. That is why the ceiling is four — the uplink cost is one copy of your
+ * video per person in the room.
+ */
+interface PeerEntry {
+  pc: RTCPeerConnection;
+  controller: AdaptiveVideoController | null;
+  stream: MediaStream | null;
+  iceBuffer: RTCIceCandidateInit[];
+  remoteDescSet: boolean;
+  muted: boolean;
+  videoOff: boolean;
+  connected: boolean;
+  quality: QualityLevel | null;
+}
+
 const QUALITY_COLOR: Record<QualityLevel, string> = {
-  good: "#22c55e",
-  fair: "#eab308",
-  poor: "#f97316",
+  good: "#34d399",
+  fair: "#fbbf24",
+  poor: "#fb923c",
   bad: "#ef4444",
 };
 
@@ -71,7 +91,8 @@ const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
 ];
 
-/** Turn a getUserMedia failure into something a human can act on. */
+const NAME_STORAGE_KEY = "videocall:display-name";
+
 function describeMediaError(err: unknown): string {
   const name = err instanceof DOMException ? err.name : "";
   switch (name) {
@@ -89,92 +110,206 @@ function describeMediaError(err: unknown): string {
   }
 }
 
+/** Initial for a tile when there is no video to show. */
+function initialOf(name: string | null | undefined): string {
+  const trimmed = (name ?? "").trim();
+  return trimmed.length > 0 ? trimmed[0]!.toUpperCase() : "?";
+}
+
+/** Track viewport orientation so a two-person call stacks on a phone. */
+function useViewport() {
+  const [size, setSize] = useState(() => ({
+    w: typeof window === "undefined" ? 1280 : window.innerWidth,
+    h: typeof window === "undefined" ? 800 : window.innerHeight,
+  }));
+
+  useEffect(() => {
+    const onResize = () => setSize({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("orientationchange", onResize);
+    };
+  }, []);
+
+  return size;
+}
+
 export default function Room() {
   const { roomId } = useParams<{ roomId: string }>();
   const [, setLocation] = useLocation();
+  const { w: viewportWidth, h: viewportHeight } = useViewport();
 
+  const prejoinVideoRef = useRef<HTMLVideoElement>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
-  const remoteVideoRef = useRef<HTMLVideoElement>(null);
-  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const remoteVideoRefs = useRef(new Map<string, HTMLVideoElement>());
   const socketRef = useRef<Socket | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
-  const remoteParticipantIdRef = useRef<string | null>(null);
+  const peersRef = useRef(new Map<string, PeerEntry>());
   const iceServersRef = useRef<RTCIceServer[]>(FALLBACK_ICE_SERVERS);
-  const iceBufferRef = useRef<RTCIceCandidateInit[]>([]);
-  const remoteDescSetRef = useRef(false);
   const audioOnlyRef = useRef(false);
-  const qualityRef = useRef<AdaptiveVideoController | null>(null);
   // Mirrors of state so socket callbacks always read current values.
   const isMutedRef = useRef(false);
   const isVideoOffRef = useRef(false);
 
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
-  const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
-  const [remoteMuted, setRemoteMuted] = useState(false);
-  const [remoteVideoOff, setRemoteVideoOff] = useState(false);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [mediaError, setMediaError] = useState<string | null>(null);
+  const [mediaReady, setMediaReady] = useState(false);
   const [audioOnlyMode, setAudioOnlyMode] = useState(false);
   const [callSeconds, setCallSeconds] = useState(0);
   const [quality, setQuality] = useState<QualityLevel | null>(null);
+
   // Roster comes from the server, never inferred from whether video is flowing.
   const [roster, setRoster] = useState<RosterEntry[]>([]);
   const [isHost, setIsHost] = useState(false);
   const [selfParticipantId, setSelfParticipantId] = useState<string | null>(null);
   const [joinAttempt, setJoinAttempt] = useState(0);
+
+  // Pre-join: name + camera check before entering the call.
+  const [joined, setJoined] = useState(false);
+  const [displayName, setDisplayName] = useState(() => {
+    try {
+      return localStorage.getItem(NAME_STORAGE_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const [roomHostName, setRoomHostName] = useState<string | null>(null);
+  const [roomPeople, setRoomPeople] = useState(0);
   /**
-   * Which sheet is open. Hosts get a choice when they tap Leave (leave vs end
-   * the room) and a host menu for the rare actions; guests never see either.
+   * Whether the room is worth preparing for. The pre-join screen asks for the
+   * camera, so a link to a room that no longer exists (or was closed by the
+   * host) must be refused *before* that — otherwise people grant camera access
+   * and only then discover there is nothing to join.
    */
+  const [roomCheck, setRoomCheck] = useState<"checking" | "open" | "closed" | "missing">("checking");
+
+  /** Which sheet is open. Hosts get choices; guests never see either. */
   const [sheet, setSheet] = useState<null | "leave" | "host" | "confirm-remove">(null);
+  const [removeTarget, setRemoveTarget] = useState<{ id: string; name: string } | null>(null);
 
-  // WhatsApp-style swap: false = remote is main, true = local is main
-  const [isSwapped, setIsSwapped] = useState(false);
+  // Bumped whenever a peer's stream, mute state or connection changes, so the
+  // grid re-renders without putting MediaStreams in React state.
+  const [peerVersion, setPeerVersion] = useState(0);
+  const bumpPeers = useCallback(() => setPeerVersion((v) => v + 1), []);
 
-  // Draggable PiP state
-  const [pipPosition, setPipPosition] = useState({ x: 16, y: 80 });
-  const dragging = useRef(false);
-  const dragMoved = useRef(false);
-  const dragOffset = useRef({ x: 0, y: 0 });
-
-  // --- Draggable PiP handlers ---
-  const handlePointerDown = useCallback((e: React.PointerEvent) => {
-    dragging.current = true;
-    dragMoved.current = false;
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    dragOffset.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    e.preventDefault();
+  /** Stop the camera and microphone for good (terminal states, leaving). */
+  const stopLocalMedia = useCallback(() => {
+    localStreamRef.current?.getTracks().forEach((track) => track.stop());
+    localStreamRef.current = null;
+    setMediaReady(false);
   }, []);
 
-  const handlePointerMove = useCallback((e: React.PointerEvent) => {
-    if (!dragging.current) return;
-    const el = e.currentTarget as HTMLElement;
-    const parent = el.parentElement;
-    if (!parent) return;
-    const parentRect = parent.getBoundingClientRect();
-    let newX = e.clientX - parentRect.left - dragOffset.current.x;
-    let newY = e.clientY - parentRect.top - dragOffset.current.y;
-    if (Math.abs(newX - pipPosition.x) > 2 || Math.abs(newY - pipPosition.y) > 2) {
-      dragMoved.current = true;
+  // --- Is there anything to join? (before the camera is touched) ---
+  useEffect(() => {
+    if (!roomId) return;
+    let cancelled = false;
+
+    void fetch(`/api/rooms/${roomId}`)
+      .then(async (res) => {
+        if (cancelled) return;
+        if (res.status === 404) {
+          setRoomCheck("missing");
+          toast.error("That room doesn't exist any more.");
+          setLocation("/");
+          return;
+        }
+        if (!res.ok) {
+          // Unknown state: let them try rather than block the call.
+          setRoomCheck("open");
+          return;
+        }
+        const room = (await res.json()) as {
+          closed?: boolean;
+          hostName?: string | null;
+          participantCount?: number;
+        };
+        if (cancelled) return;
+        if (room.hostName) setRoomHostName(room.hostName);
+        if (typeof room.participantCount === "number") setRoomPeople(room.participantCount);
+        if (room.closed) {
+          setRoomCheck("closed");
+          setStatus("closed");
+          return;
+        }
+        setRoomCheck("open");
+      })
+      .catch(() => {
+        if (!cancelled) setRoomCheck("open");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [roomId, setLocation]);
+
+  // --- Local media (pre-join preview and the call share one stream) ---
+  useEffect(() => {
+    if (roomCheck !== "open") return;
+    let cancelled = false;
+
+    const acquire = async () => {
+      try {
+        const constraints: MediaStreamConstraints = audioOnlyRef.current
+          ? { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false }
+          : {
+              audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+              // Cap the uplink: 720p/24 is far kinder to a mobile connection
+              // than an uncapped 1080p stream. Group calls step down further.
+              video: {
+                width: { ideal: 1280, max: 1280 },
+                height: { ideal: 720, max: 720 },
+                frameRate: { ideal: 24, max: 30 },
+              },
+            };
+
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+
+        localStreamRef.current = stream;
+        stream.getAudioTracks().forEach((track) => {
+          track.enabled = !isMutedRef.current;
+        });
+        stream.getVideoTracks().forEach((track) => {
+          track.enabled = !isVideoOffRef.current;
+        });
+
+        if (prejoinVideoRef.current) prejoinVideoRef.current.srcObject = stream;
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        setMediaReady(true);
+        setMediaError(null);
+      } catch (err) {
+        if (cancelled) return;
+        console.error("Media permission error", err);
+        setMediaError(describeMediaError(err));
+      }
+    };
+
+    void acquire();
+
+    return () => {
+      cancelled = true;
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      localStreamRef.current = null;
+    };
+    // audioOnly switches the capture profile; everything else is stable.
+  }, [audioOnlyMode, roomCheck]);
+
+  // Keep whichever preview element is mounted pointed at the local stream.
+  useEffect(() => {
+    if (prejoinVideoRef.current && localStreamRef.current) {
+      prejoinVideoRef.current.srcObject = localStreamRef.current;
     }
-    newX = Math.max(8, Math.min(newX, parentRect.width - el.offsetWidth - 8));
-    newY = Math.max(8, Math.min(newY, parentRect.height - el.offsetHeight - 8));
-    setPipPosition({ x: newX, y: newY });
-  }, [pipPosition.x, pipPosition.y]);
-
-  const handlePointerUp = useCallback(() => {
-    dragging.current = false;
-  }, []);
-
-  // Only treat a tap as "swap" if the PiP was not dragged.
-  const handlePipTap = useCallback(() => {
-    if (!dragMoved.current) {
-      setIsSwapped((prev) => !prev);
+    if (localVideoRef.current && localStreamRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current;
     }
-    dragMoved.current = false;
-  }, []);
+  }, [joined, mediaReady]);
 
   // --- Call timer ---
   useEffect(() => {
@@ -184,13 +319,13 @@ export default function Room() {
     return () => window.clearInterval(interval);
   }, [status]);
 
-  // --- WebRTC + signaling ---
+  // --- WebRTC mesh + signaling ---
   //
   // Identity, not sockets: this browser presents the same participantId on
   // every join, so a reload or a reconnect reclaims its seat rather than
   // arriving as a second person and filling the room with ghosts.
   useEffect(() => {
-    if (!roomId) return;
+    if (!roomId || !joined || !mediaReady) return;
 
     let cancelled = false;
     // Set once the room is closed or we are removed: nothing may move the UI
@@ -216,8 +351,163 @@ export default function Room() {
     // that joined as a guest can take the host seat once it is free.
     const storedSecret = getHostSecret(roomId);
 
+    const name = displayName.trim() || "Guest";
+
     // Built fresh each time: a later reclaim switches the identity used here.
-    const joinPayload = () => ({ roomId, participantId, hostSecret, displayName: null });
+    const joinPayload = () => ({ roomId, participantId, hostSecret, displayName: name });
+
+    const peers = peersRef.current;
+
+    const closePeer = (peerId: string) => {
+      const entry = peers.get(peerId);
+      if (!entry) return;
+      entry.controller?.stop();
+      entry.pc.ontrack = null;
+      entry.pc.onicecandidate = null;
+      entry.pc.oniceconnectionstatechange = null;
+      entry.pc.onconnectionstatechange = null;
+      try {
+        entry.pc.close();
+      } catch {
+        /* already closed */
+      }
+      peers.delete(peerId);
+      remoteVideoRefs.current.delete(peerId);
+      bumpPeers();
+    };
+
+    const closeAllPeers = () => {
+      for (const peerId of [...peers.keys()]) closePeer(peerId);
+    };
+
+    /** Status from what the mesh actually looks like right now. */
+    const refreshStatus = () => {
+      if (terminal) return;
+      const entries = [...peers.values()];
+      if (entries.length === 0) {
+        setStatus("waiting");
+        return;
+      }
+      if (entries.some((entry) => entry.connected || entry.pc.connectionState === "connected")) {
+        setStatus("connected");
+        return;
+      }
+      setStatus("connecting");
+    };
+
+    /** The best connection in the room is what the pill should show. */
+    const refreshQuality = () => {
+      const levels = [...peers.values()]
+        .map((entry) => entry.quality)
+        .filter((level): level is QualityLevel => level !== null);
+      if (levels.length === 0) {
+        setQuality(null);
+        return;
+      }
+      const order: QualityLevel[] = ["good", "fair", "poor", "bad"];
+      levels.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+      setQuality(levels[0]);
+    };
+
+    /** Create (or reuse) the peer connection for one other participant. */
+    const ensurePeer = (peerId: string): PeerEntry => {
+      const existing = peers.get(peerId);
+      if (existing) return existing;
+
+      const pc = new RTCPeerConnection({
+        iceServers: iceServersRef.current,
+        iceCandidatePoolSize: 2,
+      });
+
+      const entry: PeerEntry = {
+        pc,
+        controller: null,
+        stream: null,
+        iceBuffer: [],
+        remoteDescSet: false,
+        muted: false,
+        videoOff: false,
+        connected: false,
+        quality: null,
+      };
+      peers.set(peerId, entry);
+
+      const stream = localStreamRef.current;
+      if (stream) stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      // Offer hardware-accelerated H.264 before VP9/AV1.
+      preferHardwareCodecs(pc);
+
+      pc.ontrack = (event) => {
+        const [remoteStream] = event.streams;
+        if (!remoteStream) return;
+        entry.stream = remoteStream;
+        entry.connected = true;
+        const el = remoteVideoRefs.current.get(peerId);
+        if (el && el.srcObject !== remoteStream) el.srcObject = remoteStream;
+        bumpPeers();
+        refreshStatus();
+      };
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        socketRef.current?.emit("ice-candidate", {
+          candidate: event.candidate.toJSON(),
+          to: peerId,
+        });
+      };
+
+      // Without this the call froze forever after the network changed.
+      pc.oniceconnectionstatechange = () => {
+        const state = pc.iceConnectionState;
+        if (state === "failed") {
+          try {
+            pc.restartIce();
+          } catch {
+            /* browser does not support ICE restart */
+          }
+          if (!terminal) setStatus("reconnecting");
+        } else if (state === "disconnected") {
+          if (!terminal) setStatus("reconnecting");
+        } else if (state === "connected" || state === "completed") {
+          entry.connected = true;
+          refreshStatus();
+          bumpPeers();
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === "failed" && !terminal) setStatus("failed");
+      };
+
+      return entry;
+    };
+
+    const startQualityLoop = (entry: PeerEntry, peerId: string) => {
+      entry.controller?.stop();
+      const controller = new AdaptiveVideoController();
+      entry.controller = controller;
+      controller.start(entry.pc, (level) => {
+        entry.quality = level;
+        refreshQuality();
+        if (level !== "good") {
+          console.info(`[call] link to ${peerId} degraded to ${level}`);
+        }
+      });
+    };
+
+    const flushCandidates = async (entry: PeerEntry) => {
+      entry.remoteDescSet = true;
+      const buffered = entry.iceBuffer;
+      entry.iceBuffer = [];
+      for (const candidate of buffered) {
+        try {
+          await entry.pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.warn("Dropping buffered ICE candidate", err);
+        }
+      }
+    };
 
     const resolveIdentity = async () => {
       try {
@@ -228,7 +518,12 @@ export default function Room() {
           return false;
         }
         if (res.ok) {
-          const room = (await res.json()) as { closed?: boolean; hostConnected?: boolean };
+          const room = (await res.json()) as {
+            closed?: boolean;
+            hostConnected?: boolean;
+            hostName?: string | null;
+          };
+          if (room.hostName) setRoomHostName(room.hostName);
           if (room.closed) {
             terminal = true;
             setStatus("closed");
@@ -256,118 +551,11 @@ export default function Room() {
       });
     };
 
-    /** Create (or recreate) the peer connection for the current local stream. */
-    const createPeer = (socket: Socket): RTCPeerConnection => {
-      // Close the old connection only — never stop sender tracks here, they
-      // are the live local camera/mic stream that the new PC will reuse.
-      pcRef.current?.close();
-
-      iceBufferRef.current = [];
-      remoteDescSetRef.current = false;
-
-      const pc = new RTCPeerConnection({
-        iceServers: iceServersRef.current,
-        iceCandidatePoolSize: 2,
-      });
-      pcRef.current = pc;
-
-      const stream = localStreamRef.current;
-      if (stream) {
-        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-      }
-
-      // Offer hardware-accelerated H.264 before VP9/AV1. Software-encoding a
-      // modern codec on a cheap phone is what makes a call stutter and drains
-      // the battery that was holding the connection up.
-      preferHardwareCodecs(pc);
-
-      pc.ontrack = (event) => {
-        const [remoteStream] = event.streams;
-        if (remoteVideoRef.current && remoteStream) {
-          remoteVideoRef.current.srcObject = remoteStream;
-          setHasRemoteVideo(true);
-          setStatus("connected");
-        }
-      };
-
-      pc.onicecandidate = (event) => {
-        if (!event.candidate || !remoteParticipantIdRef.current) return;
-        socket.emit("ice-candidate", {
-          candidate: event.candidate.toJSON(),
-          to: remoteParticipantIdRef.current,
-        });
-      };
-
-      // Without this the call froze forever after the network changed.
-      pc.oniceconnectionstatechange = () => {
-        const state = pc.iceConnectionState;
-        if (state === "failed") {
-          try {
-            pc.restartIce();
-          } catch {
-            /* browser does not support ICE restart */
-          }
-          setStatus("reconnecting");
-        } else if (state === "disconnected") {
-          setStatus("reconnecting");
-        } else if (state === "connected" || state === "completed") {
-          setStatus("connected");
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === "failed") setStatus("failed");
-      };
-
-      return pc;
-    };
-
-    const flushCandidates = async (pc: RTCPeerConnection) => {
-      remoteDescSetRef.current = true;
-      const buffered = iceBufferRef.current;
-      iceBufferRef.current = [];
-      for (const candidate of buffered) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.warn("Dropping buffered ICE candidate", err);
-        }
-      }
-    };
-
-    /**
-     * Start the adaptive quality loop for this peer connection: it measures the
-     * link every couple of seconds and moves the video profile up or down to
-     * match, instead of letting the encoder overrun a weak connection.
-     */
-    const startQualityLoop = (pc: RTCPeerConnection) => {
-      qualityRef.current?.stop();
-      const controller = new AdaptiveVideoController();
-      qualityRef.current = controller;
-      controller.start(pc, setQuality);
-    };
-
-    /** Release hardware, peer connection and quality loop for good. */
-    const stopEverything = () => {
-      localStreamRef.current?.getTracks().forEach((track) => track.stop());
-      localStreamRef.current = null;
-      if (localVideoRef.current) localVideoRef.current.srcObject = null;
-      qualityRef.current?.stop();
-      qualityRef.current = null;
-      pcRef.current?.close();
-      pcRef.current = null;
-      setHasRemoteVideo(false);
-    };
-
     /**
      * A tab of the host's own browser that joined as a guest (because the host
      * was still in the call elsewhere) keeps watching the room. When the host's
      * seat has been free for a while — the other window was closed — this tab
-     * takes it back, so the room never becomes uncontrollable just because a
-     * window was closed.
-     *
-     * "For a while" matters: a host who is merely reconnecting has a free seat
-     * for a moment, and there is no point in two windows fighting over it.
+     * takes it back.
      */
     let reclaimTimer: number | null = null;
     let freeObservations = 0;
@@ -384,8 +572,6 @@ export default function Room() {
     const startReclaimWatch = (socket: Socket) => {
       if (!storedSecret || reclaimTimer !== null) return;
       const storedHostId = getHostParticipantId(roomId);
-      // No stored host id means this tab either is the host or never created
-      // the room; there is no seat to reclaim.
       if (!storedHostId || storedHostId === participantId) return;
 
       reclaimTimer = window.setInterval(() => {
@@ -410,8 +596,7 @@ export default function Room() {
 
             // Three consecutive checks with nobody in the host seat: take it.
             // A short random delay keeps two windows of the same browser from
-            // claiming on the same tick; the loser would be sent back to a
-            // guest seat for no reason.
+            // claiming on the same tick.
             stopReclaimWatch();
             window.setTimeout(() => {
               if (cancelled || terminal || claimingHost) return;
@@ -433,9 +618,9 @@ export default function Room() {
     };
 
     const start = async () => {
-      // 0. Who is this tab in this room? Decided before the camera is touched,
-      //    so a closed room never turns it on.
+      // 0. Who is this tab in this room?
       if (!(await resolveIdentity())) return;
+      if (cancelled) return;
 
       // 1. ICE servers (server-provided, so TURN can change without a rebuild).
       try {
@@ -452,31 +637,7 @@ export default function Room() {
 
       if (cancelled) return;
 
-      // 2. Local media.
-      try {
-        const constraints: MediaStreamConstraints = audioOnlyRef.current
-          ? { audio: true, video: false }
-          : {
-              audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-              // Cap the uplink: 720p/24 is far kinder to a mobile connection than
-              // an uncapped 1080p stream.
-              video: { width: { ideal: 1280, max: 1280 }, height: { ideal: 720, max: 720 }, frameRate: { ideal: 24, max: 30 } },
-            };
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
-        if (cancelled) {
-          stream.getTracks().forEach((track) => track.stop());
-          return;
-        }
-        localStreamRef.current = stream;
-        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-      } catch (err) {
-        if (cancelled) return;
-        console.error("Media permission error", err);
-        setMediaError(describeMediaError(err));
-        return;
-      }
-
-      // 3. Signaling socket. Re-emits `join-room` on every (re)connect, which
+      // 2. Signaling socket. Re-emits `join-room` on every (re)connect, which
       //    is what keeps a call alive across a network blip.
       const socket = io({ path: "/socket.io", transports: ["websocket", "polling"] });
       socketRef.current = socket;
@@ -484,15 +645,9 @@ export default function Room() {
       socket.on("connect", () => {
         if (terminal) return;
         setStatus("connecting");
-        setHasRemoteVideo(false);
-        remoteParticipantIdRef.current = null;
-        // Fresh peer connection per connection attempt.
-        if (pcRef.current) {
-          pcRef.current.ontrack = null;
-          pcRef.current.onicecandidate = null;
-          pcRef.current.close();
-          pcRef.current = null;
-        }
+        // Fresh mesh per connection attempt: every peer connection belongs to
+        // the socket that negotiated it.
+        closeAllPeers();
         socket.emit("join-room", joinPayload());
       });
 
@@ -502,14 +657,7 @@ export default function Room() {
 
       socket.on(
         "room-joined",
-        ({
-          participants,
-          isHost: hostFlag,
-        }: {
-          participants?: RosterEntry[];
-          isHost?: boolean;
-          reclaimed?: boolean;
-        }) => {
+        ({ participants, isHost: hostFlag }: { participants?: RosterEntry[]; isHost?: boolean }) => {
           claimingHost = Boolean(hostFlag);
           setIsHost(Boolean(hostFlag));
           if (claimingHost) stopReclaimWatch();
@@ -519,12 +667,9 @@ export default function Room() {
           const others = (participants ?? []).filter(
             (p) => p.participantId !== participantId && p.connected,
           );
-          if (others.length > 0) {
-            // They will send us an offer once `user-connected` reaches them.
-            setStatus("connecting");
-          } else {
-            setStatus("waiting");
-          }
+          // Peers already in the call will offer to us; we do not offer first
+          // (see `user-connected`), which keeps the mesh free of offer glare.
+          setStatus(others.length > 0 ? "connecting" : "waiting");
           emitMediaState();
           if (!claimingHost) startReclaimWatch(socket);
         },
@@ -535,6 +680,14 @@ export default function Room() {
         ({ participants, count }: { participants?: RosterEntry[]; count?: number }) => {
           const next = participants ?? [];
           setRoster(next);
+
+          // Any peer that left the room loses its connection here too.
+          const present = new Set(next.filter((p) => p.connected).map((p) => p.participantId));
+          for (const peerId of [...peers.keys()]) {
+            if (!present.has(peerId)) closePeer(peerId);
+          }
+
+          refreshStatus();
           if (typeof count === "number" && count < 1) setStatus("waiting");
         },
       );
@@ -576,19 +729,14 @@ export default function Room() {
       socket.on("room-closed", () => {
         terminal = true;
         setStatus("closed");
-        // Terminal: turn the hardware off, not just the video element.
-        stopEverything();
+        closeAllPeers();
+        stopLocalMedia();
         window.setTimeout(() => socket.disconnect(), 0);
       });
 
       /**
-       * Another window of this browser took the seat this one was holding —
-       * a duplicated tab, or two windows racing to reclaim the host seat.
-       *
-       * Only one socket can own a seat, so this one stands down — but it does
-       * not throw the person out of the call: it asks for an ordinary guest
-       * seat instead. If a seat is gone (the winner is a guest and the other
-       * slot is taken) the normal room-full retry takes over.
+       * Another window of this browser took the seat this one was holding.
+       * Stand down to an ordinary guest seat rather than leaving the call.
        */
       socket.on("session-replaced", () => {
         if (terminal) return;
@@ -596,13 +744,7 @@ export default function Room() {
         setIsHost(false);
         participantId = getParticipantId();
         hostSecret = null;
-        // The peer was talking to the identity that just lost the seat.
-        remoteParticipantIdRef.current = null;
-        qualityRef.current?.stop();
-        qualityRef.current = null;
-        pcRef.current?.close();
-        pcRef.current = null;
-        setHasRemoteVideo(false);
+        closeAllPeers();
         setStatus("connecting");
         window.setTimeout(() => {
           if (!cancelled && !terminal && socket.connected) {
@@ -614,104 +756,124 @@ export default function Room() {
       socket.on("removed", () => {
         terminal = true;
         setStatus("removed");
-        stopEverything();
+        closeAllPeers();
+        stopLocalMedia();
         window.setTimeout(() => socket.disconnect(), 0);
       });
 
       socket.on("host-action-error", ({ action, reason }: { action?: string; reason?: string }) => {
         if (action === "end-call") toast.error("Only the host can end this call.");
         else if (action === "remove-participant")
-          toast.error(reason === "target-not-found" ? "That participant already left." : "Only the host can remove someone.");
+          toast.error(
+            reason === "target-not-found" ? "That participant already left." : "Only the host can remove someone.",
+          );
       });
 
-      socket.on("participant-removed", () => {
+      socket.on("participant-removed", ({ participantId: removed }: { participantId?: string }) => {
+        if (removed) closePeer(removed);
         toast.success("Participant removed.");
       });
 
-      // A peer is present — a newcomer, or the same person after a reload. In
-      // both cases this side offers a fresh connection: their old one is dead.
-      socket.on("user-connected", async ({ participantId: peerId }: { participantId: string }) => {
-        if (peerId === participantId) return;
-        remoteParticipantIdRef.current = peerId;
-        const pc = createPeer(socket);
-        try {
-          const offer = await pc.createOffer();
-          // Opus tuning has to happen in the SDP text — there is no API for it.
-          offer.sdp = tuneOpusSdp(offer.sdp ?? "");
-          await pc.setLocalDescription(offer);
-          socket.emit("offer", { offer, to: peerId });
-          startQualityLoop(pc);
-        } catch (err) {
-          console.error("Error creating offer", err);
-        }
-      });
+      /**
+       * Somebody joined. Everyone already in the call offers to the newcomer,
+       * which means exactly one side of each pair starts the negotiation.
+       */
+      socket.on(
+        "user-connected",
+        async ({
+          participantId: peerId,
+          displayName: peerName,
+        }: {
+          participantId: string;
+          displayName?: string | null;
+        }) => {
+          if (peerId === participantId) return;
+          // A returning peer replaces whatever connection we had to them.
+          closePeer(peerId);
+
+          const entry = ensurePeer(peerId);
+          void peerName;
+          try {
+            const offer = await entry.pc.createOffer();
+            offer.sdp = tuneOpusSdp(offer.sdp ?? "");
+            await entry.pc.setLocalDescription(offer);
+            socket.emit("offer", { offer, to: peerId });
+            startQualityLoop(entry, peerId);
+          } catch (err) {
+            console.error("Error creating offer", err);
+          }
+        },
+      );
 
       socket.on(
         "offer",
         async ({ offer, from }: { offer: RTCSessionDescriptionInit; from: string }) => {
-          remoteParticipantIdRef.current = from;
-          const pc = pcRef.current ?? createPeer(socket);
+          if (!from || from === participantId) return;
+          // The peer is offering, so any half-built connection to them is stale.
+          closePeer(from);
+          const entry = ensurePeer(from);
           try {
-            await pc.setRemoteDescription(new RTCSessionDescription(offer));
-            await flushCandidates(pc);
-            const answer = await pc.createAnswer();
+            await entry.pc.setRemoteDescription(new RTCSessionDescription(offer));
+            await flushCandidates(entry);
+            const answer = await entry.pc.createAnswer();
             answer.sdp = tuneOpusSdp(answer.sdp ?? "");
-            await pc.setLocalDescription(answer);
+            await entry.pc.setLocalDescription(answer);
             socket.emit("answer", { answer, to: from });
-            startQualityLoop(pc);
+            startQualityLoop(entry, from);
           } catch (err) {
             console.error("Error handling offer", err);
           }
         },
       );
 
-      socket.on("answer", async ({ answer }: { answer: RTCSessionDescriptionInit }) => {
-        const pc = pcRef.current;
-        if (!pc) return;
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(answer));
-          await flushCandidates(pc);
-          startQualityLoop(pc);
-        } catch (err) {
-          console.error("Error handling answer", err);
-        }
-      });
-
       socket.on(
-        "ice-candidate",
-        async ({ candidate }: { candidate: RTCIceCandidateInit }) => {
-          if (!candidate) return;
-          const pc = pcRef.current;
-          if (!pc) return;
-          if (remoteDescSetRef.current) {
-            try {
-              await pc.addIceCandidate(new RTCIceCandidate(candidate));
-            } catch (err) {
-              console.warn("Error adding ICE candidate", err);
-            }
-          } else {
-            iceBufferRef.current.push(candidate);
+        "answer",
+        async ({ answer, from }: { answer: RTCSessionDescriptionInit; from: string }) => {
+          const entry = peers.get(from);
+          if (!entry) return;
+          try {
+            await entry.pc.setRemoteDescription(new RTCSessionDescription(answer));
+            await flushCandidates(entry);
+          } catch (err) {
+            console.error("Error handling answer", err);
           }
         },
       );
 
-      socket.on("media-state", ({ audio, video }: { audio?: boolean; video?: boolean }) => {
-        setRemoteMuted(audio === false);
-        setRemoteVideoOff(video === false);
-      });
+      socket.on(
+        "ice-candidate",
+        async ({ candidate, from }: { candidate: RTCIceCandidateInit; from: string }) => {
+          if (!candidate || !from) return;
+          const entry = peers.get(from);
+          if (!entry) return;
+          if (entry.remoteDescSet) {
+            try {
+              await entry.pc.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (err) {
+              console.warn("Error adding ICE candidate", err);
+            }
+          } else {
+            entry.iceBuffer.push(candidate);
+          }
+        },
+      );
 
-      socket.on("user-disconnected", () => {
-        setHasRemoteVideo(false);
-        setRemoteMuted(false);
-        setRemoteVideoOff(false);
-        remoteParticipantIdRef.current = null;
-        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-        qualityRef.current?.stop();
-        qualityRef.current = null;
-        setQuality(null);
-        pcRef.current?.close();
-        pcRef.current = null;
-        setStatus("waiting");
+      socket.on(
+        "media-state",
+        ({ audio, video, from }: { audio?: boolean; video?: boolean; from?: string }) => {
+          if (!from) return;
+          const entry = peers.get(from);
+          if (!entry) return;
+          entry.muted = audio === false;
+          entry.videoOff = video === false;
+          bumpPeers();
+        },
+      );
+
+      socket.on("user-disconnected", ({ participantId: gone }: { participantId?: string }) => {
+        if (!gone) return;
+        closePeer(gone);
+        refreshStatus();
       });
     };
 
@@ -721,17 +883,45 @@ export default function Room() {
       cancelled = true;
       stopReclaimWatch();
       if (retryTimer !== null) window.clearTimeout(retryTimer);
-      localStreamRef.current?.getTracks().forEach((track) => track.stop());
-      localStreamRef.current = null;
-      qualityRef.current?.stop();
-      qualityRef.current = null;
-      pcRef.current?.close();
-      pcRef.current = null;
+      closeAllPeers();
       socketRef.current?.disconnect();
       socketRef.current = null;
+      setRoster([]);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId, audioOnlyMode]);
+  }, [roomId, joined, mediaReady, audioOnlyMode]);
+
+  // Attach any arriving stream to its tile (a tile may mount after ontrack).
+  useEffect(() => {
+    for (const [peerId, entry] of peersRef.current) {
+      const el = remoteVideoRefs.current.get(peerId);
+      if (el && entry.stream && el.srcObject !== entry.stream) el.srcObject = entry.stream;
+    }
+  }, [peerVersion]);
+
+  /**
+   * Group calls share the uplink, so with more than two people everybody
+   * captures smaller. One copy of 720p per peer is what makes a four-way call
+   * stutter on a phone.
+   */
+  useEffect(() => {
+    if (!joined) return;
+    const track = localStreamRef.current?.getVideoTracks()[0];
+    if (!track) return;
+
+    const people = roster.filter((p) => p.connected).length;
+    const group = people > 2;
+
+    track
+      .applyConstraints(
+        group
+          ? { width: { ideal: 640, max: 640 }, height: { ideal: 480, max: 480 }, frameRate: { ideal: 20, max: 24 } }
+          : { width: { ideal: 1280, max: 1280 }, height: { ideal: 720, max: 720 }, frameRate: { ideal: 24, max: 30 } },
+      )
+      .catch(() => {
+        /* not all devices allow re-constraining a live track */
+      });
+  }, [joined, roster]);
 
   const publishMediaState = () => {
     const socket = socketRef.current;
@@ -770,10 +960,42 @@ export default function Room() {
     }
   };
 
+  const joinCall = () => {
+    const clean = displayName.trim();
+    if (!clean) {
+      toast.error("Add a name so everyone knows who's who.");
+      return;
+    }
+    try {
+      localStorage.setItem(NAME_STORAGE_KEY, clean);
+    } catch {
+      /* storage disabled — the name still works for this call */
+    }
+    setDisplayName(clean);
+    setJoined(true);
+  };
+
+  const leaveCall = () => {
+    // Tell the server first: this releases the seat immediately instead of
+    // leaving a ghost that holds the slot until the ping timeout.
+    socketRef.current?.emit("leave");
+    for (const entry of peersRef.current.values()) {
+      entry.controller?.stop();
+      try {
+        entry.pc.close();
+      } catch {
+        /* already closed */
+      }
+    }
+    peersRef.current.clear();
+    stopLocalMedia();
+    socketRef.current?.disconnect();
+    setLocation("/");
+  };
+
   /**
-   * The single red button. Guests leave immediately, exactly as before. A host
-   * gets the sheet, because "leave" and "end it for everyone" are very
-   * different and must not be one mis-tap apart.
+   * The single red button. Guests leave immediately. A host gets the sheet,
+   * because "leave" and "end it for everyone" must not be one mis-tap apart.
    */
   const handleLeavePressed = () => {
     if (!isHost) {
@@ -783,33 +1005,18 @@ export default function Room() {
     setSheet("leave");
   };
 
-  const leaveCall = () => {
-    // Tell the server first: this releases the seat immediately instead of
-    // leaving a ghost that holds the slot until the ping timeout.
-    socketRef.current?.emit("leave");
-    localStreamRef.current?.getTracks().forEach((track) => track.stop());
-    pcRef.current?.close();
-    socketRef.current?.disconnect();
-    setLocation("/");
-  };
-
-  /**
-   * Host-only: end the call for everyone and close the room permanently.
-   * The server re-checks ownership; this call is refused if we are not the host.
-   */
+  /** Host-only: end the call for everyone and close the room permanently. */
   const endCallForEveryone = () => {
     if (!roomId) return;
     const socket = socketRef.current;
 
     if (socket?.connected) {
       // The server re-verifies ownership, closes the room and broadcasts
-      // `room-closed` to everyone (host included). The listener above does the
-      // teardown, so the UI only changes once the server has actually closed it.
+      // `room-closed` to everyone (host included).
       socket.emit("end-call");
       return;
     }
 
-    // Socket is down: close over REST. The server notifies the room from there.
     const participantId = getParticipantId();
     const hostSecret = getHostSecret(roomId);
     if (!participantId || !hostSecret) {
@@ -824,6 +1031,7 @@ export default function Room() {
       .then((res) => {
         if (!res.ok) throw new Error(String(res.status));
         setStatus("closed");
+        stopLocalMedia();
       })
       .catch(() => toast.error("Couldn't close the room. Check your connection and try again."));
   };
@@ -844,45 +1052,72 @@ export default function Room() {
     return `${mins}:${secs}`;
   };
 
-  if (mediaError) {
-    return (
-      <div style={{ minHeight: "100dvh", background: "#0a0a0f", display: "flex", alignItems: "center", justifyContent: "center", padding: "24px" }}>
-        <div style={{ background: "rgba(124,92,252,0.08)", border: "1px solid rgba(124,92,252,0.2)", borderRadius: "20px", padding: "32px", textAlign: "center", maxWidth: "420px", width: "100%" }}>
-          <div style={{ width: "64px", height: "64px", borderRadius: "50%", background: "rgba(239,68,68,0.15)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}>
-            <VideoOff style={{ color: "#ef4444", width: "28px", height: "28px" }} aria-hidden="true" />
-          </div>
-          <h2 style={{ color: "#fff", fontSize: "20px", fontWeight: 700, marginBottom: "8px" }}>
-            Camera unavailable
-          </h2>
-          <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "14px", lineHeight: 1.6 }}>{mediaError}</p>
+  // --- Derived view state ---
+  const connectedPeople = roster.filter((p) => p.connected);
+  const participantCount = Math.max(connectedPeople.length, 1);
+  const others = connectedPeople.filter((p) => p.participantId !== selfParticipantId);
 
-          <Button
-            onClick={() => {
-              setMediaError(null);
-              setAudioOnlyMode(true);
-              audioOnlyRef.current = true;
-              setStatus("connecting");
-            }}
-            style={{ width: "100%", marginTop: "20px", background: "linear-gradient(135deg, #7c5cfc, #6c47ff)", border: "none", borderRadius: "12px", color: "#fff", fontWeight: 600, padding: "12px", cursor: "pointer" }}
-          >
-            Join with audio only
-          </Button>
-          <Button
-            onClick={() => window.location.reload()}
-            style={{ width: "100%", marginTop: "10px", background: "rgba(255,255,255,0.08)", border: "none", borderRadius: "12px", color: "#fff", fontWeight: 600, padding: "12px", cursor: "pointer" }}
-          >
-            <RotateCcw style={{ width: "16px", height: "16px", marginRight: "8px" }} aria-hidden="true" />
-            Try again
-          </Button>
-        </div>
-      </div>
-    );
-  }
+  const selfName = displayName.trim() || (isHost ? roomHostName : null) || "You";
+  const tiles = useMemo(() => {
+    const list: Array<{
+      id: string;
+      name: string;
+      isSelf: boolean;
+      role: "host" | "guest";
+      muted: boolean;
+      videoOff: boolean;
+      hasStream: boolean;
+    }> = [
+      {
+        id: "self",
+        name: selfName,
+        isSelf: true,
+        role: isHost ? "host" : "guest",
+        muted: isMuted,
+        videoOff: isVideoOff || audioOnlyMode,
+        hasStream: Boolean(localStreamRef.current),
+      },
+    ];
 
-  /**
-   * Terminal states. These are not retried: the room is closed or this
-   * participant was removed, and the server will refuse a rejoin anyway.
-   */
+    for (const person of others) {
+      const entry = peersRef.current.get(person.participantId);
+      list.push({
+        id: person.participantId,
+        name: person.displayName ?? (person.role === "host" ? "Host" : "Guest"),
+        isSelf: false,
+        role: person.role,
+        muted: entry?.muted ?? false,
+        videoOff: entry?.videoOff ?? false,
+        hasStream: Boolean(entry?.stream),
+      });
+    }
+    return list;
+  }, [selfName, isHost, isMuted, isVideoOff, audioOnlyMode, others, peerVersion, joined]);
+
+  // 1 person: full screen. 2: stacked on a phone, side by side on a desktop.
+  // 3: one wide tile with two underneath on a phone (a 2×2 would leave a dead
+  // quadrant), three across on a desktop. 4: a 2×2 grid.
+  const portrait = viewportHeight >= viewportWidth;
+  const gridStyle = useMemo<React.CSSProperties>(() => {
+    const count = tiles.length;
+    if (count <= 1) return { gridTemplateColumns: "1fr", gridTemplateRows: "1fr" };
+    if (count === 2) {
+      return portrait
+        ? { gridTemplateColumns: "1fr", gridTemplateRows: "1fr 1fr" }
+        : { gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1fr" };
+    }
+    if (count === 3) {
+      return portrait
+        ? { gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1.15fr 1fr" }
+        : { gridTemplateColumns: "1fr 1fr 1fr", gridTemplateRows: "1fr" };
+    }
+    return { gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1fr 1fr" };
+  }, [tiles.length, portrait]);
+
+  /** In the three-person portrait layout your own tile spans the full width. */
+  const selfSpansRow = tiles.length === 3 && portrait;
+
+  // --- Terminal states -----------------------------------------------------
   if (status === "closed" || status === "removed" || status === "replaced") {
     const closed = status === "closed";
     const replaced = status === "replaced";
@@ -919,32 +1154,146 @@ export default function Room() {
     );
   }
 
+  // --- Camera unavailable --------------------------------------------------
+  if (mediaError && !mediaReady) {
+    return (
+      <div style={{ minHeight: "100dvh", background: "#0a0a0f", display: "flex", alignItems: "center", justifyContent: "center", padding: "24px" }}>
+        <div style={{ background: "rgba(124,92,252,0.08)", border: "1px solid rgba(124,92,252,0.2)", borderRadius: "20px", padding: "32px", textAlign: "center", maxWidth: "420px", width: "100%" }}>
+          <div style={{ width: "64px", height: "64px", borderRadius: "50%", background: "rgba(239,68,68,0.15)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px" }}>
+            <VideoOff style={{ color: "#ef4444", width: "28px", height: "28px" }} aria-hidden="true" />
+          </div>
+          <h2 style={{ color: "#fff", fontSize: "20px", fontWeight: 700, marginBottom: "8px" }}>
+            Camera unavailable
+          </h2>
+          <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "14px", lineHeight: 1.6 }}>{mediaError}</p>
+
+          <Button
+            onClick={() => {
+              audioOnlyRef.current = true;
+              setAudioOnlyMode(true);
+              setMediaError(null);
+            }}
+            style={{ width: "100%", marginTop: "20px", background: "linear-gradient(135deg, #7c5cfc, #6c47ff)", border: "none", borderRadius: "12px", color: "#fff", fontWeight: 600, padding: "12px", cursor: "pointer" }}
+          >
+            Continue with audio only
+          </Button>
+          <Button
+            onClick={() => window.location.reload()}
+            style={{ width: "100%", marginTop: "10px", background: "rgba(255,255,255,0.08)", border: "none", borderRadius: "12px", color: "#fff", fontWeight: 600, padding: "12px", cursor: "pointer" }}
+          >
+            <RotateCcw style={{ width: "16px", height: "16px", marginRight: "8px" }} aria-hidden="true" />
+            Try again
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Still working out whether the room exists --------------------------
+  if (!joined && roomCheck === "checking") {
+    return (
+      <div style={{ minHeight: "100dvh", background: "#0a0a0f", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <Loader2 style={{ width: "28px", height: "28px", color: "#7c5cfc", animation: "spin 1s linear infinite" }} aria-hidden="true" />
+      </div>
+    );
+  }
+
+  // --- Pre-join: name + camera check --------------------------------------
+  if (!joined) {
+    return (
+      <div style={{ minHeight: "100dvh", background: "#0a0a0f", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "20px", gap: "18px" }}>
+        <div style={{ width: "100%", maxWidth: "460px", display: "flex", flexDirection: "column", gap: "16px" }}>
+          <div style={{ textAlign: "center" }}>
+            <h1 style={{ color: "#fff", fontSize: "22px", fontWeight: 700, margin: 0 }}>
+              {isHost ? "You're hosting" : "Ready to join?"}
+            </h1>
+            <p style={{ color: "rgba(255,255,255,0.45)", fontSize: "13px", margin: "6px 0 0" }}>
+              Room {roomId?.slice(0, 8)} ·{" "}
+              {roomPeople === 0
+                ? "you'll be the first here"
+                : `${roomPeople} ${roomPeople === 1 ? "person" : "people"} already in the call`}
+            </p>
+          </div>
+
+          <div style={{ position: "relative", width: "100%", aspectRatio: "4 / 3", borderRadius: "18px", overflow: "hidden", background: "#14141f", border: "1px solid rgba(255,255,255,0.08)" }}>
+            {audioOnlyMode || isVideoOff ? (
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: "10px" }}>
+                <div style={{ width: "64px", height: "64px", borderRadius: "50%", background: "rgba(124,92,252,0.18)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <span style={{ color: "#c4b5fd", fontSize: "24px", fontWeight: 700 }}>{initialOf(displayName)}</span>
+                </div>
+                <span style={{ color: "rgba(255,255,255,0.4)", fontSize: "12px" }}>
+                  {audioOnlyMode ? "Audio only" : "Camera off"}
+                </span>
+              </div>
+            ) : (
+              <video
+                ref={prejoinVideoRef}
+                autoPlay
+                playsInline
+                muted
+                style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }}
+              />
+            )}
+
+            {isMuted && (
+              <div style={{ position: "absolute", top: "10px", left: "10px", width: "26px", height: "26px", borderRadius: "50%", background: "rgba(239,68,68,0.85)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <MicOff style={{ width: "13px", height: "13px", color: "#fff" }} aria-hidden="true" />
+              </div>
+            )}
+          </div>
+
+          <input
+            value={displayName}
+            onChange={(event) => setDisplayName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") joinCall();
+            }}
+            maxLength={40}
+            placeholder="Your name"
+            aria-label="Your name"
+            style={{ width: "100%", height: "52px", borderRadius: "14px", border: "1px solid rgba(255,255,255,0.12)", background: "#14141f", color: "#fff", padding: "0 16px", fontSize: "15px", outline: "none" }}
+          />
+
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "12px" }}>
+            <button
+              onClick={toggleMute}
+              aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
+              aria-pressed={isMuted}
+              style={{ width: "52px", height: "52px", borderRadius: "50%", border: "none", background: isMuted ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.1)", color: isMuted ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}
+            >
+              {isMuted ? <MicOff style={{ width: "20px", height: "20px" }} /> : <Mic style={{ width: "20px", height: "20px" }} />}
+            </button>
+            <button
+              onClick={toggleVideo}
+              disabled={audioOnlyMode}
+              aria-label={isVideoOff ? "Turn camera on" : "Turn camera off"}
+              aria-pressed={isVideoOff}
+              style={{ width: "52px", height: "52px", borderRadius: "50%", border: "none", background: isVideoOff ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.1)", color: isVideoOff ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: audioOnlyMode ? "not-allowed" : "pointer", opacity: audioOnlyMode ? 0.4 : 1 }}
+            >
+              {isVideoOff || audioOnlyMode ? <VideoOff style={{ width: "20px", height: "20px" }} /> : <VideoIcon style={{ width: "20px", height: "20px" }} />}
+            </button>
+          </div>
+
+          <Button
+            onClick={joinCall}
+            disabled={!mediaReady}
+            style={{ width: "100%", height: "54px", background: "linear-gradient(135deg, #7c5cfc, #6c47ff)", border: "none", borderRadius: "16px", color: "#fff", fontWeight: 700, fontSize: "16px", cursor: mediaReady ? "pointer" : "not-allowed", opacity: mediaReady ? 1 : 0.6 }}
+          >
+            {mediaReady ? "Join call" : "Starting camera…"}
+          </Button>
+
+          <button
+            onClick={() => setLocation("/")}
+            style={{ background: "none", border: "none", color: "rgba(255,255,255,0.4)", fontSize: "13px", cursor: "pointer" }}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const showWaiting = status === "waiting" || status === "connecting";
-  const connectedCount = roster.filter((p) => p.connected).length;
-  const participantCount = Math.max(connectedCount, 1);
-  const remotePeer = roster.find(
-    (p) => p.connected && p.participantId !== selfParticipantId,
-  );
-  const selfEntry = roster.find((p) => p.participantId === selfParticipantId);
-  const showRemoteVideoOff = remoteVideoOff;
-
-  const pipWrapperStyle: React.CSSProperties = {
-    position: "absolute",
-    left: `${pipPosition.x}px`,
-    top: `${pipPosition.y}px`,
-    width: "120px",
-    height: "160px",
-    borderRadius: "16px",
-    overflow: "hidden",
-    border: "2px solid rgba(124,92,252,0.4)",
-    boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-    cursor: "grab",
-    zIndex: 20,
-    touchAction: "none",
-    background: "#1a1a2e",
-  };
-
-  const mainWrapperStyle: React.CSSProperties = { position: "absolute", inset: 0 };
 
   return (
     <div style={{ minHeight: "100dvh", background: "#0a0a0f", display: "flex", flexDirection: "column", position: "relative", overflow: "hidden" }}>
@@ -975,7 +1324,9 @@ export default function Room() {
             <p style={{ color: "rgba(255,255,255,0.4)", fontSize: "11px", margin: 0, display: "flex", alignItems: "center", gap: "4px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
               <ShieldCheck style={{ width: "10px", height: "10px", flexShrink: 0 }} aria-hidden="true" />
               {/* On a phone the badge lives here instead of taking its own pill. */}
-              <span className="host-subtitle-label" aria-hidden="true">Host · </span>
+              {isHost && (
+                <span className="host-subtitle-label" aria-hidden="true">Host · </span>
+              )}
               Encrypted in transit · {formatDuration(callSeconds)}
             </p>
           </div>
@@ -1126,114 +1477,138 @@ export default function Room() {
         </div>
       )}
 
-      {/* Video Area */}
-      <div style={{ flex: 1, position: "relative", width: "100%", height: "100%" }}>
-        {/* Remote video — main when !isSwapped, PiP when isSwapped */}
-        <div
-          onPointerDown={isSwapped ? handlePointerDown : undefined}
-          onPointerMove={isSwapped ? handlePointerMove : undefined}
-          onPointerUp={isSwapped ? handlePointerUp : undefined}
-          onClick={isSwapped ? handlePipTap : undefined}
-          style={isSwapped ? pipWrapperStyle : mainWrapperStyle}
-        >
-          <video
-            ref={remoteVideoRef}
-            autoPlay
-            playsInline
-            style={{ width: "100%", height: "100%", objectFit: "cover", background: "#0a0a0f" }}
-          />
-          {showRemoteVideoOff && hasRemoteVideo && (
-            <div style={{ position: "absolute", inset: 0, background: "rgba(10,10,15,0.92)", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: "8px" }}>
-              <VideoOff style={{ color: "rgba(255,255,255,0.3)", width: "32px", height: "32px" }} aria-hidden="true" />
-              <span style={{ color: "rgba(255,255,255,0.4)", fontSize: "12px" }}>Camera off</span>
-            </div>
-          )}
-          {isSwapped && (
-            <div style={{ position: "absolute", top: "6px", right: "6px", width: "22px", height: "22px", borderRadius: "50%", background: "rgba(124,92,252,0.6)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4" />
-              </svg>
-            </div>
-          )}
-        </div>
-
-        {/* Local video — PiP when !isSwapped, main when isSwapped */}
-        <div
-          onPointerDown={!isSwapped ? handlePointerDown : undefined}
-          onPointerMove={!isSwapped ? handlePointerMove : undefined}
-          onPointerUp={!isSwapped ? handlePointerUp : undefined}
-          onClick={!isSwapped ? handlePipTap : undefined}
-          style={!isSwapped ? pipWrapperStyle : mainWrapperStyle}
-        >
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            muted
-            style={{ width: "100%", height: "100%", objectFit: "cover", background: "#0a0a0f", transform: "scaleX(-1)" }}
-          />
-
-          <div
-            style={{
-              position: "absolute",
-              bottom: isSwapped ? "100px" : "6px",
-              left: isSwapped ? "16px" : "6px",
-              background: "rgba(0,0,0,0.6)",
-              borderRadius: "6px",
-              padding: "2px 8px",
-              color: "#fff",
-              fontSize: isSwapped ? "12px" : "10px",
-              fontWeight: 600,
-              zIndex: 1,
-            }}
-          >
-            You
-          </div>
-
-          {!isSwapped && (
-            <div style={{ position: "absolute", top: "6px", right: "6px", width: "22px", height: "22px", borderRadius: "50%", background: "rgba(124,92,252,0.6)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4" />
-              </svg>
-            </div>
-          )}
-
-          {(isVideoOff || audioOnlyMode) && (
-            <div style={{ position: "absolute", inset: 0, background: "rgba(10,10,15,0.9)", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: "6px" }}>
-              <VideoOff style={{ color: "rgba(255,255,255,0.3)", width: "24px", height: "24px" }} aria-hidden="true" />
-              {audioOnlyMode && <span style={{ color: "rgba(255,255,255,0.4)", fontSize: "9px" }}>Audio only</span>}
-            </div>
-          )}
-
-          {isMuted && (
-            <div style={{ position: "absolute", top: "6px", left: "6px", width: "20px", height: "20px", borderRadius: "50%", background: "rgba(239,68,68,0.8)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <MicOff style={{ width: "10px", height: "10px", color: "#fff" }} aria-hidden="true" />
-            </div>
-          )}
-        </div>
-
-        {/* Waiting overlay — shown over the main area until someone joins */}
-        {showWaiting && (
-          <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(10,10,15,0.85)", zIndex: 10, paddingTop: "56px", gap: "12px" }}>
-            <div style={{ width: "80px", height: "80px", borderRadius: "50%", background: "rgba(124,92,252,0.15)", display: "flex", alignItems: "center", justifyContent: "center", animation: "pulse 2s ease-in-out infinite" }}>
-              {status === "connecting" ? (
-                <Loader2 style={{ color: "#7c5cfc", width: "36px", height: "36px" }} aria-hidden="true" />
-              ) : (
-                <Users style={{ color: "#7c5cfc", width: "36px", height: "36px" }} aria-hidden="true" />
+      {/* Video grid: one tile per person, your own included. */}
+      <div
+        className="video-grid"
+        data-tile-count={tiles.length}
+        style={{
+          flex: 1,
+          display: "grid",
+          gap: "8px",
+          padding: "64px 8px 96px",
+          width: "100%",
+          height: "100%",
+          ...gridStyle,
+        }}
+      >
+        {tiles.map((tile) =>
+          tile.isSelf ? (
+            <div
+              key="self"
+              data-testid="tile-self"
+              data-muted={tile.muted ? "true" : "false"}
+              data-video-off={tile.videoOff ? "true" : "false"}
+              style={{
+                position: "relative",
+                borderRadius: "16px",
+                overflow: "hidden",
+                background: "#14141f",
+                border: "1px solid rgba(124,92,252,0.28)",
+                minHeight: 0,
+                ...(selfSpansRow ? { gridColumn: "1 / -1" } : {}),
+              }}
+            >
+              <video
+                ref={localVideoRef}
+                autoPlay
+                playsInline
+                muted
+                style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)", display: tile.videoOff ? "none" : "block" }}
+              />
+              {tile.videoOff && (
+                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <div style={{ width: "72px", height: "72px", borderRadius: "50%", background: "rgba(124,92,252,0.2)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <span style={{ color: "#c4b5fd", fontSize: "26px", fontWeight: 700 }}>{initialOf(tile.name)}</span>
+                  </div>
+                </div>
+              )}
+              <div style={{ position: "absolute", left: "8px", bottom: "8px", display: "flex", alignItems: "center", gap: "5px", background: "rgba(0,0,0,0.55)", borderRadius: "8px", padding: "3px 8px" }}>
+                <span style={{ color: "#fff", fontSize: "11px", fontWeight: 600 }}>You</span>
+                {audioOnlyMode && <span style={{ color: "rgba(255,255,255,0.4)", fontSize: "9px" }}>Audio only</span>}
+              </div>
+              {tile.muted && (
+                <div style={{ position: "absolute", top: "8px", right: "8px", width: "24px", height: "24px", borderRadius: "50%", background: "rgba(239,68,68,0.8)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <MicOff style={{ width: "12px", height: "12px", color: "#fff" }} aria-hidden="true" />
+                </div>
               )}
             </div>
-            <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "16px", margin: 0 }}>
-              {status === "connecting" ? "Connecting…" : "Waiting for others to join…"}
-            </p>
-            {status === "waiting" && (
-              <button
-                onClick={copyLink}
-                style={{ display: "flex", alignItems: "center", gap: "6px", background: "rgba(124,92,252,0.15)", border: "1px solid rgba(124,92,252,0.35)", color: "#c4b5fd", borderRadius: "999px", padding: "8px 16px", fontSize: "13px", cursor: "pointer" }}
-              >
-                <Copy style={{ width: "14px", height: "14px" }} aria-hidden="true" />
-                Copy the invite link
-              </button>
-            )}
+          ) : (
+            <div
+              key={tile.id}
+              data-testid="tile-remote"
+              data-participant-id={tile.id}
+              data-name={tile.name}
+              data-muted={tile.muted ? "true" : "false"}
+              data-video-off={tile.videoOff ? "true" : "false"}
+              data-has-stream={tile.hasStream ? "true" : "false"}
+              style={{ position: "relative", borderRadius: "16px", overflow: "hidden", background: "#14141f", border: "1px solid rgba(255,255,255,0.08)", minHeight: 0 }}
+            >
+              <video
+                ref={(el) => {
+                  if (!el) {
+                    remoteVideoRefs.current.delete(tile.id);
+                    return;
+                  }
+                  remoteVideoRefs.current.set(tile.id, el);
+                  const entry = peersRef.current.get(tile.id);
+                  if (entry?.stream && el.srcObject !== entry.stream) el.srcObject = entry.stream;
+                }}
+                autoPlay
+                playsInline
+                style={{ width: "100%", height: "100%", objectFit: "cover", display: tile.hasStream && !tile.videoOff ? "block" : "none" }}
+              />
+
+              {(!tile.hasStream || tile.videoOff) && (
+                <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+                  <div style={{ width: "72px", height: "72px", borderRadius: "50%", background: "rgba(255,255,255,0.08)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <span style={{ color: "rgba(255,255,255,0.7)", fontSize: "26px", fontWeight: 700 }}>{initialOf(tile.name)}</span>
+                  </div>
+                  {!tile.videoOff && (
+                    <span style={{ color: "rgba(255,255,255,0.35)", fontSize: "11px" }}>Connecting…</span>
+                  )}
+                </div>
+              )}
+
+              <div style={{ position: "absolute", left: "8px", bottom: "8px", display: "flex", alignItems: "center", gap: "5px", maxWidth: "calc(100% - 16px)", background: "rgba(0,0,0,0.55)", borderRadius: "8px", padding: "3px 8px" }}>
+                {tile.role === "host" && <Crown style={{ width: "10px", height: "10px", color: "#c4b5fd", flexShrink: 0 }} aria-hidden="true" />}
+                <span style={{ color: "#fff", fontSize: "11px", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {tile.name}
+                </span>
+              </div>
+
+              {tile.muted && (
+                <div style={{ position: "absolute", top: "8px", right: "8px", width: "24px", height: "24px", borderRadius: "50%", background: "rgba(239,68,68,0.8)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <MicOff style={{ width: "12px", height: "12px", color: "#fff" }} aria-hidden="true" />
+                </div>
+              )}
+            </div>
+          ),
+        )}
+
+        {/* Waiting overlay — only while nobody else is here. */}
+        {tiles.length === 1 && showWaiting && (
+          <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 10, pointerEvents: "none" }}>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "12px", background: "rgba(10,10,15,0.82)", borderRadius: "20px", padding: "24px 28px", pointerEvents: "auto" }}>
+              <div style={{ width: "64px", height: "64px", borderRadius: "50%", background: "rgba(124,92,252,0.15)", display: "flex", alignItems: "center", justifyContent: "center", animation: "pulse 2s ease-in-out infinite" }}>
+                {status === "connecting" ? (
+                  <Loader2 style={{ color: "#7c5cfc", width: "30px", height: "30px" }} aria-hidden="true" />
+                ) : (
+                  <Users style={{ color: "#7c5cfc", width: "30px", height: "30px" }} aria-hidden="true" />
+                )}
+              </div>
+              <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "15px", margin: 0 }}>
+                {status === "connecting" ? "Connecting…" : "Waiting for others to join…"}
+              </p>
+              {status === "waiting" && (
+                <button
+                  onClick={copyLink}
+                  style={{ display: "flex", alignItems: "center", gap: "6px", background: "rgba(124,92,252,0.15)", border: "1px solid rgba(124,92,252,0.35)", color: "#c4b5fd", borderRadius: "999px", padding: "8px 16px", fontSize: "13px", cursor: "pointer" }}
+                >
+                  <Copy style={{ width: "14px", height: "14px" }} aria-hidden="true" />
+                  Copy the invite link
+                </button>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -1255,47 +1630,37 @@ export default function Room() {
       >
         <div
           className="call-controls"
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            // The host adds two more controls. On a phone that does not fit on
-            // one line, so the bar wraps instead of pushing buttons off-screen.
-            flexWrap: "wrap",
-            gap: "10px 12px",
-            width: "100%",
-            maxWidth: "520px",
-          }}
+          style={{ display: "flex", alignItems: "center", justifyContent: "center", flexWrap: "wrap", gap: "10px 12px", width: "100%", maxWidth: "520px" }}
         >
           <div className="call-controls-group" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          <button
-            onClick={toggleMute}
-            aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
-            aria-pressed={isMuted}
-            style={{ width: "52px", height: "52px", flex: "0 0 auto", borderRadius: "50%", border: "none", background: isMuted ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)", color: isMuted ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", backdropFilter: "blur(12px)" }}
-          >
-            {isMuted ? <MicOff className="w-5 h-5" aria-hidden="true" /> : <Mic className="w-5 h-5" aria-hidden="true" />}
-          </button>
+            <button
+              onClick={toggleMute}
+              aria-label={isMuted ? "Unmute microphone" : "Mute microphone"}
+              aria-pressed={isMuted}
+              style={{ width: "52px", height: "52px", flex: "0 0 auto", borderRadius: "50%", border: "none", background: isMuted ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)", color: isMuted ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", backdropFilter: "blur(12px)" }}
+            >
+              {isMuted ? <MicOff className="w-5 h-5" aria-hidden="true" /> : <Mic className="w-5 h-5" aria-hidden="true" />}
+            </button>
 
-          <button
-            onClick={toggleVideo}
-            disabled={audioOnlyMode}
-            aria-label={isVideoOff ? "Turn camera on" : "Turn camera off"}
-            aria-pressed={isVideoOff}
-            style={{ width: "52px", height: "52px", flex: "0 0 auto", borderRadius: "50%", border: "none", background: isVideoOff ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)", color: isVideoOff ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: audioOnlyMode ? "not-allowed" : "pointer", opacity: audioOnlyMode ? 0.4 : 1, backdropFilter: "blur(12px)" }}
-          >
-            {isVideoOff || audioOnlyMode ? <VideoOff className="w-5 h-5" aria-hidden="true" /> : <VideoIcon className="w-5 h-5" aria-hidden="true" />}
-          </button>
+            <button
+              onClick={toggleVideo}
+              disabled={audioOnlyMode}
+              aria-label={isVideoOff ? "Turn camera on" : "Turn camera off"}
+              aria-pressed={isVideoOff}
+              style={{ width: "52px", height: "52px", flex: "0 0 auto", borderRadius: "50%", border: "none", background: isVideoOff ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.15)", color: isVideoOff ? "#ef4444" : "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: audioOnlyMode ? "not-allowed" : "pointer", opacity: audioOnlyMode ? 0.4 : 1, backdropFilter: "blur(12px)" }}
+            >
+              {isVideoOff || audioOnlyMode ? <VideoOff className="w-5 h-5" aria-hidden="true" /> : <VideoIcon className="w-5 h-5" aria-hidden="true" />}
+            </button>
 
-          <button
-            onClick={handleLeavePressed}
-            aria-label="Leave call"
-            aria-haspopup={isHost ? "dialog" : undefined}
-            style={{ height: "52px", borderRadius: "26px", border: "none", background: "linear-gradient(135deg, #ef4444, #dc2626)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 22px", cursor: "pointer", fontWeight: 600, fontSize: "14px", whiteSpace: "nowrap", flex: "0 0 auto", boxShadow: "0 4px 20px rgba(239,68,68,0.4)" }}
-          >
-            <PhoneOff className="w-5 h-5" aria-hidden="true" />
-            <span className="control-label">Leave</span>
-          </button>
+            <button
+              onClick={handleLeavePressed}
+              aria-label="Leave call"
+              aria-haspopup={isHost ? "dialog" : undefined}
+              style={{ height: "52px", borderRadius: "26px", border: "none", background: "linear-gradient(135deg, #ef4444, #dc2626)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", padding: "0 22px", cursor: "pointer", fontWeight: 600, fontSize: "14px", whiteSpace: "nowrap", flex: "0 0 auto", boxShadow: "0 4px 20px rgba(239,68,68,0.4)" }}
+            >
+              <PhoneOff className="w-5 h-5" aria-hidden="true" />
+              <span className="control-label">Leave</span>
+            </button>
           </div>
         </div>
       </div>
@@ -1344,18 +1709,20 @@ export default function Room() {
                 void copyLink();
               },
             },
-            ...(remotePeer
-              ? [
-                  {
-                    id: "remove-participant",
-                    label: `Remove ${remotePeer.displayName ?? "the other person"}`,
-                    description: "They are disconnected and cannot rejoin",
-                    icon: UserX,
-                    tone: "warning" as const,
-                    onSelect: () => setSheet("confirm-remove"),
-                  },
-                ]
-              : []),
+            ...others.map((person) => ({
+              id: `remove-${person.participantId}`,
+              label: `Remove ${person.displayName ?? "this person"}`,
+              description: "They are disconnected and cannot rejoin",
+              icon: UserX,
+              tone: "warning" as const,
+              onSelect: () => {
+                setRemoveTarget({
+                  id: person.participantId,
+                  name: person.displayName ?? "this person",
+                });
+                setSheet("confirm-remove");
+              },
+            })),
           ] as SheetAction[]
         }
         onClose={() => setSheet(null)}
@@ -1364,7 +1731,7 @@ export default function Room() {
       {/* Removing someone is permanent, so it gets its own confirmation. */}
       <ActionSheet
         open={sheet === "confirm-remove"}
-        title={`Remove ${remotePeer?.displayName ?? "the other person"}?`}
+        title={`Remove ${removeTarget?.name ?? "this person"}?`}
         description="They will be disconnected and cannot rejoin this room."
         actions={[
           {
@@ -1373,27 +1740,34 @@ export default function Room() {
             icon: UserX,
             tone: "danger",
             onSelect: () => {
-              if (remotePeer) removeParticipant(remotePeer.participantId);
+              if (removeTarget) removeParticipant(removeTarget.id);
+              setRemoveTarget(null);
             },
           },
         ]}
-        onClose={() => setSheet(null)}
+        onClose={() => {
+          setSheet(null);
+          setRemoveTarget(null);
+        }}
       />
 
       <style>{`
-        /* Phone widths: tighten the spacing first, and drop the wording on the
-           host's two secondary actions before anything is allowed to overflow. */
+        /* Phone widths: tighten the spacing, and let the header keep the room
+           name by folding the badge into the subtitle. */
         .host-subtitle-label { display: none; }
         @media (max-width: 430px) {
           .host-subtitle-label { display: inline !important; }
           .call-controls { gap: 8px !important; }
+          .call-controls-group { gap: 8px !important; }
+          .call-controls-bar { padding-left: 8px !important; padding-right: 8px !important; }
           /* The room name matters more than the words on these buttons. */
-          .copy-link-label { display: none; }
+          .copy-link-label { display: none !important; }
           .host-badge { display: none !important; }
           .quality-label { display: none !important; }
           .quality-pill { padding: 4px 8px !important; }
-          .call-controls-group { gap: 8px !important; }
-          .call-controls-bar { padding-left: 8px !important; padding-right: 8px !important; }
+        }
+        @media (max-width: 380px) {
+          .video-grid { padding-left: 6px !important; padding-right: 6px !important; }
         }
         @keyframes spin {
           from { transform: rotate(0deg); }

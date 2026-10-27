@@ -71,8 +71,11 @@ per-client credentials) — set `CLOUDFLARE_TURN_KEY_ID` and
 **Single instance only.** Presence lives in process. Scaling out needs
 `REDIS_URL`, which attaches the Socket.IO Redis adapter.
 
-**1-on-1 only.** The room model caps at two participants. Group calls are a
-design change, not a config change.
+**Four people, and that is the ceiling.** A group call is a peer **mesh**: each
+browser holds one connection per other person, so four people means three
+connections each and three copies of your video going upstream. That is why the
+capture drops to 640×480/20 fps once a third person joins. Beyond four, the
+honest answer is a media server (SFU), not more peers — see `MAX_PARTICIPANTS`.
 
 **Host powers are tied to one browser profile.** The host secret lives in that
 browser's `localStorage`, keyed by room id. Clearing site data, using private
@@ -131,6 +134,22 @@ A duplicated tab shares `sessionStorage` with its source, so both would present
 the same id. The newer join wins the seat and the older tab is told
 `session-replaced`, shows "Opened in another window" and releases the camera —
 no silent collision. Opening the link in a new tab does not do this.
+
+### Group calling (up to 4)
+
+- **Mesh, not SFU.** `MAX_PARTICIPANTS` defaults to 4. Every participant holds a
+  peer connection per other participant; the roster comes from the server and is
+  the only source of truth for who is in the call.
+- **Pre-join screen.** A link opens a name + camera check, not the call. The room
+  is looked up *before* the camera is touched, so a closed or missing room is
+  refused without asking for permissions.
+- **Grid.** One person fills the screen; two stack on a phone and sit side by
+  side on a desktop; three put your own tile full-width above two others on a
+  phone; four use a 2×2 grid.
+- **Uplink discipline.** Above two people everybody captures at 640×480/20 fps,
+  and the per-peer adaptive quality loop still steps down further on a bad link.
+- **Names** are required at the pre-join screen, remembered in `localStorage`,
+  and sent with the join so every tile is labelled (host tiles carry a crown).
 
 ### The control model
 

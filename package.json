@@ -8,7 +8,8 @@
     "typecheck:libs": "tsc --build --force",
     "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck",
     "test": "pnpm -r --if-present run test",
-    "dev": "pnpm --parallel --filter @workspace/api-server --filter @workspace/video-call run dev"
+    "dev": "pnpm --parallel --filter @workspace/api-server --filter @workspace/video-call run dev",
+    "e2e": "node scripts/e2e/group.mjs && node scripts/e2e/one-to-one.mjs && node scripts/e2e/layout.mjs"
   },
   "private": true,
   "devDependencies": {

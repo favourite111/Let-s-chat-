@@ -145,15 +145,21 @@ describe("ownership", () => {
 });
 
 describe("joining and capacity", () => {
-  it("lets two people in and refuses the third", async () => {
+  it("fills a four-person room and refuses the fifth", async () => {
     const room = await ownedRoom();
 
     assert.equal((await join(room.id, HOST, { hostSecret: SECRET })).ok, true);
     assert.equal((await join(room.id, GUEST_A)).ok, true);
+    assert.equal((await join(room.id, GUEST_B)).ok, true);
+    assert.equal((await join(room.id, GUEST_C)).ok, true);
 
-    const third = await join(room.id, GUEST_B);
-    assert.equal(third.ok, false);
-    assert.equal(third.reason, "full");
+    const fifth = await join(room.id, "p_guest_00000004");
+    assert.equal(fifth.ok, false);
+    assert.equal(fifth.reason, "full");
+
+    const seats = (await roomParticipants(room.id)).filter((p) => p.socketId);
+    assert.equal(seats.length, 4, "four connected people");
+    assert.equal(seats.filter((p) => p.role === "host").length, 1, "and still exactly one host");
   });
 
   it("does not give a reloading participant a second seat", async () => {
@@ -187,12 +193,18 @@ describe("joining and capacity", () => {
     const room = await ownedRoom();
     await join(room.id, HOST, { hostSecret: SECRET });
     await join(room.id, GUEST_A);
+    await join(room.id, GUEST_B);
+    await join(room.id, GUEST_C);
 
     // GUEST_A loses their connection: the seat is held for the grace period.
     await leaveRoom(room.id, GUEST_A, `sock-${GUEST_A}`);
 
     // Someone else can now take the free *slot*...
-    assert.equal((await join(room.id, GUEST_B)).ok, true, "a dead seat must not block the room");
+    assert.equal(
+      (await join(room.id, "p_guest_00000004")).ok,
+      true,
+      "a dead seat must not block the room",
+    );
 
     // ...but the original participant cannot hold two seats when they return.
     const back = await join(room.id, GUEST_A, { socketId: "sock-guest-a-2" });
@@ -200,7 +212,7 @@ describe("joining and capacity", () => {
     assert.equal(back.reason, "full");
 
     const connected = (await roomParticipants(room.id)).filter((p) => p.socketId);
-    assert.equal(connected.length, 2, "never more than the limit");
+    assert.equal(connected.length, 4, "never more than the limit");
   });
 
   it("purges seats abandoned past the grace period", async () => {
@@ -222,24 +234,27 @@ describe("joining and capacity", () => {
     assert.equal(fresh.reclaimed, false);
   });
 
-  it("keeps exactly two winners when three people join at once", async () => {
+  it("keeps exactly four winners when six people join at once", async () => {
     const room = await ownedRoom();
 
     const results = await Promise.all([
       join(room.id, HOST, { hostSecret: SECRET }),
       join(room.id, GUEST_A),
       join(room.id, GUEST_B),
+      join(room.id, GUEST_C),
+      join(room.id, "p_guest_00000004"),
+      join(room.id, "p_guest_00000005"),
     ]);
 
     const accepted = results.filter((r) => r.ok);
     const refused = results.filter((r) => !r.ok);
 
-    assert.equal(accepted.length, 2, "capacity must hold under a simultaneous join");
-    assert.equal(refused.length, 1);
+    assert.equal(accepted.length, 4, "capacity must hold under a simultaneous join");
+    assert.equal(refused.length, 2);
     assert.equal(refused[0].reason, "full");
 
     const connected = (await roomParticipants(room.id)).filter((p) => p.socketId);
-    assert.equal(connected.length, 2);
+    assert.equal(connected.length, 4);
     assert.deepEqual(
       connected.map((p) => p.participantId).sort(),
       accepted.map((r) => r.participant.participantId).sort(),

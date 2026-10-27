@@ -54,7 +54,12 @@ const MAX_ROOMS = Number(process.env.MAX_ROOMS ?? 20_000);
  * Seats in a room. Still 2 — group calling is a later phase; nothing here
  * assumes a pair beyond this number.
  */
-const MAX_PARTICIPANTS = Number(process.env.MAX_PARTICIPANTS ?? 2);
+/**
+ * How many people one room holds. Four is the deliberate ceiling for a peer
+ * mesh: every extra person multiplies the uplink by another copy of your video,
+ * so beyond this a media server is the right answer rather than more peers.
+ */
+const MAX_PARTICIPANTS = Math.max(2, Number(process.env.MAX_PARTICIPANTS ?? 4));
 
 export interface PublicRoom {
   id: string;
